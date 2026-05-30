@@ -6,7 +6,12 @@ import {
   buildUnifiedThreadWindow,
   encodeUnifiedPayloadFrame,
 } from "@farfield/unified-surface";
-import { getHealth, readThread } from "../src/lib/api";
+import {
+  getHealth,
+  listSidebarThreads,
+  readThread,
+  readThreadContentRef,
+} from "../src/lib/api";
 
 describe("api transport", () => {
   afterEach(() => {
@@ -118,5 +123,111 @@ describe("api transport", () => {
 
     expect(result.thread.turns.map((turn) => turn.id)).toEqual(["turn-2"]);
     expect(result.window?.range.hasMoreBefore).toBe(true);
+  });
+
+  it("reads content refs through the binary API", async () => {
+    const ref = {
+      id: "thread:thread-1:turn:turn-1:item:item-1:field:aggregatedOutput",
+      kind: "commandOutput",
+      contentType: "text",
+      byteLength: 12,
+      preview: "hello",
+    };
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        expect(url.pathname).toBe(
+          "/api/unified/thread/thread-1/content/thread%3Athread-1%3Aturn%3Aturn-1%3Aitem%3Aitem-1%3Afield%3AaggregatedOutput",
+        );
+        expect(url.searchParams.get("provider")).toBe("codex");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("Accept")).toBe(UNIFIED_BINARY_HTTP_CONTENT_TYPE);
+        const frame = encodeUnifiedPayloadFrame(
+          JsonValueSchema.parse({
+            ok: true,
+            ref,
+            value: "hello world!",
+          }),
+        );
+        const body = new ArrayBuffer(frame.byteLength);
+        new Uint8Array(body).set(frame);
+        return new Response(body, {
+          status: 200,
+          headers: {
+            "Content-Type": UNIFIED_BINARY_HTTP_CONTENT_TYPE,
+          },
+        });
+      }),
+    );
+
+    await expect(
+      readThreadContentRef("thread-1", ref.id, { provider: "codex" }),
+    ).resolves.toEqual({
+      ref,
+      value: "hello world!",
+    });
+  });
+
+  it("sends provider cursors when reading sidebar pages", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        expect(url.pathname).toBe("/api/unified/sidebar");
+        expect(url.searchParams.get("limit")).toBe("80");
+        expect(url.searchParams.get("codexCursor")).toBe("codex-next");
+        expect(url.searchParams.get("opencodeCursor")).toBe("opencode-next");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("Accept")).toBe(UNIFIED_BINARY_HTTP_CONTENT_TYPE);
+        const frame = encodeUnifiedPayloadFrame(
+          JsonValueSchema.parse({
+            ok: true,
+            rows: [],
+            cursors: {
+              codex: null,
+              opencode: null,
+            },
+            errors: {
+              codex: null,
+              opencode: null,
+            },
+          }),
+        );
+        const body = new ArrayBuffer(frame.byteLength);
+        new Uint8Array(body).set(frame);
+        return new Response(body, {
+          status: 200,
+          headers: {
+            "Content-Type": UNIFIED_BINARY_HTTP_CONTENT_TYPE,
+          },
+        });
+      }),
+    );
+
+    await expect(
+      listSidebarThreads({
+        limit: 80,
+        archived: false,
+        all: false,
+        maxPages: 1,
+        cursors: {
+          codex: "codex-next",
+          opencode: "opencode-next",
+        },
+      }),
+    ).resolves.toEqual({
+      rows: [],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+      refreshing: false,
+    });
   });
 });

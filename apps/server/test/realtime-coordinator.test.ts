@@ -142,6 +142,10 @@ function buildCoreState(threadId = "thread-1"): UnifiedRealtimeCoreState {
           source: "codex",
         },
       ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
       errors: {
         codex: null,
         opencode: null,

@@ -7,25 +7,33 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
-import type { UnifiedItem, UnifiedItemKind } from "@farfield/unified-surface";
-import { formatDurationSeconds } from "@/lib/tool-call-ui";
+import type {
+  JsonValue,
+  UnifiedContentRef,
+  UnifiedItem,
+  UnifiedItemKind,
+} from "@farfield/unified-surface";
+import { AgentMessageBlock } from "./AgentMessageBlock";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { CommandBlock } from "./CommandBlock";
 import { DiffBlock } from "./DiffBlock";
 import { MarkdownText } from "./MarkdownText";
 import { McpToolBlock } from "./McpToolBlock";
+import { DynamicToolCallBlock } from "./DynamicToolCallBlock";
 import { ToolCallRow } from "./ToolCallRow";
 
 type UserMessageLikeItem = Extract<
   UnifiedItem,
   { type: "userMessage" | "steeringUserMessage" }
 >;
+type ContentRefLoader = (ref: UnifiedContentRef) => Promise<JsonValue>;
 
 interface Props {
   item: UnifiedItem;
   isLast: boolean;
   turnIsInProgress: boolean;
   onSelectThread: (threadId: string) => void;
+  onLoadContentRef: ContentRefLoader;
   previousItemType?: UnifiedItem["type"] | undefined;
   nextItemType?: UnifiedItem["type"] | undefined;
 }
@@ -118,6 +126,7 @@ interface RendererContext {
   isActive: boolean;
   toolSpacing: string;
   onSelectThread: (threadId: string) => void;
+  onLoadContentRef: ContentRefLoader;
 }
 
 type ItemRendererMap = {
@@ -157,12 +166,12 @@ const ITEM_RENDERERS = {
     );
   },
 
-  agentMessage: ({ item }) => {
-    if (!item.text) {
+  agentMessage: ({ item, onLoadContentRef }) => {
+    if (!item.text && !item.textRef) {
       return null;
     }
 
-    return <MarkdownText text={item.text} />;
+    return <AgentMessageBlock item={item} onLoadContentRef={onLoadContentRef} />;
   },
 
   error: ({ item }) => (
@@ -176,9 +185,9 @@ const ITEM_RENDERERS = {
     </div>
   ),
 
-  reasoning: ({ item, isActive }) => {
+  reasoning: ({ item, isActive, onLoadContentRef }) => {
     const summary = item.summary ?? [];
-    if (summary.length === 0 && !item.text) {
+    if (summary.length === 0 && !item.text && !item.textRef) {
       return null;
     }
 
@@ -186,7 +195,9 @@ const ITEM_RENDERERS = {
       <ReasoningBlock
         summary={summary.length > 0 ? summary : ["Thinking…"]}
         text={item.text}
+        textRef={item.textRef}
         isActive={isActive}
+        onLoadContentRef={onLoadContentRef}
       />
     );
   },
@@ -264,15 +275,19 @@ const ITEM_RENDERERS = {
     );
   },
 
-  commandExecution: ({ item, isActive, toolSpacing }) => (
+  commandExecution: ({ item, isActive, toolSpacing, onLoadContentRef }) => (
     <div className={toolSpacing}>
-      <CommandBlock item={item} isActive={isActive} />
+      <CommandBlock
+        item={item}
+        isActive={isActive}
+        onLoadContentRef={onLoadContentRef}
+      />
     </div>
   ),
 
-  fileChange: ({ item, toolSpacing }) => (
+  fileChange: ({ item, toolSpacing, onLoadContentRef }) => (
     <div className={toolSpacing}>
-      <DiffBlock changes={item.changes} />
+      <DiffBlock changes={item.changes} onLoadContentRef={onLoadContentRef} />
     </div>
   ),
 
@@ -299,46 +314,21 @@ const ITEM_RENDERERS = {
     </ToolCallRow>
   ),
 
-  mcpToolCall: ({ item, toolSpacing }) => (
-    <McpToolBlock item={item} className={toolSpacing} />
+  mcpToolCall: ({ item, toolSpacing, onLoadContentRef }) => (
+    <McpToolBlock
+      item={item}
+      className={toolSpacing}
+      onLoadContentRef={onLoadContentRef}
+    />
   ),
 
-  dynamicToolCall: ({ item, toolSpacing }) => {
-    const argumentsText = JSON.stringify(item.arguments);
-    const statusText = toolStatusText(item.status);
-    return (
-      <ToolCallRow
-        icon={Wrench}
-        iconClassName="text-amber-400"
-        title={item.tool}
-        className={toolSpacing}
-        meta={
-          <span className="flex items-center gap-1.5">
-            {statusText}
-            {item.durationMs != null && (
-              <span>
-                {formatDurationSeconds(item.durationMs)}
-              </span>
-            )}
-          </span>
-        }
-      >
-        {item.success !== undefined && item.success !== null && (
-          <div className="text-[11px] text-muted-foreground">
-            success: {item.success ? "yes" : "no"}
-          </div>
-        )}
-        {item.contentItems && item.contentItems.length > 0 && (
-          <div className="mt-2 text-xs text-muted-foreground">
-            Output parts: {item.contentItems.length}
-          </div>
-        )}
-        <div className="mt-2 text-[11px] text-muted-foreground whitespace-pre-wrap break-all">
-          {argumentsText}
-        </div>
-      </ToolCallRow>
-    );
-  },
+  dynamicToolCall: ({ item, toolSpacing, onLoadContentRef }) => (
+    <DynamicToolCallBlock
+      item={item}
+      className={toolSpacing}
+      onLoadContentRef={onLoadContentRef}
+    />
+  ),
 
   collabAgentToolCall: ({ item, toolSpacing }) => (
     <ToolCallRow
@@ -508,6 +498,7 @@ function ConversationItemComponent({
   isLast,
   turnIsInProgress,
   onSelectThread,
+  onLoadContentRef,
   previousItemType,
   nextItemType,
 }: Props) {
@@ -518,6 +509,7 @@ function ConversationItemComponent({
     isActive,
     toolSpacing,
     onSelectThread,
+    onLoadContentRef,
   });
 }
 
@@ -527,6 +519,7 @@ function areConversationItemPropsEqual(prev: Props, next: Props): boolean {
     prev.isLast === next.isLast &&
     prev.turnIsInProgress === next.turnIsInProgress &&
     prev.onSelectThread === next.onSelectThread &&
+    prev.onLoadContentRef === next.onLoadContentRef &&
     prev.previousItemType === next.previousItemType &&
     prev.nextItemType === next.nextItemType
   );

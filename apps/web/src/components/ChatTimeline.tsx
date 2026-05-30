@@ -1,7 +1,11 @@
 import { memo } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ArrowDown } from "lucide-react";
-import type { UnifiedItem } from "@farfield/unified-surface";
+import type {
+  JsonValue,
+  UnifiedContentRef,
+  UnifiedItem,
+} from "@farfield/unified-surface";
 import { ConversationItem } from "@/components/ConversationItem";
 import { Button } from "@/components/ui/button";
 
@@ -15,6 +19,8 @@ export interface ChatTimelineEntry {
   spacingTop: number;
 }
 
+type ContentRefLoader = (ref: UnifiedContentRef) => Promise<JsonValue>;
+
 interface ChatTimelineProps {
   selectedThreadId: string | null;
   isLoading: boolean;
@@ -24,6 +30,7 @@ interface ChatTimelineProps {
   visibleConversationItems: ChatTimelineEntry[];
   isChatAtBottom: boolean;
   onSelectThread: (threadId: string) => void;
+  onLoadContentRef: ContentRefLoader;
   onShowOlder: () => void;
   onScrollToBottom: () => void;
   scrollRef: React.RefObject<HTMLDivElement | null>;
@@ -71,6 +78,7 @@ export const ChatTimeline = memo(function ChatTimeline({
   visibleConversationItems,
   isChatAtBottom,
   onSelectThread,
+  onLoadContentRef,
   onShowOlder,
   onScrollToBottom,
   scrollRef,
@@ -146,6 +154,7 @@ export const ChatTimeline = memo(function ChatTimeline({
                       isLast={entry.isLast}
                       turnIsInProgress={entry.turnIsInProgress}
                       onSelectThread={onSelectThread}
+                      onLoadContentRef={onLoadContentRef}
                       previousItemType={entry.previousItemType}
                       nextItemType={entry.nextItemType}
                     />

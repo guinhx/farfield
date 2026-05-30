@@ -3,6 +3,7 @@ import {
   UnifiedThreadSchema,
   buildUnifiedThreadWindow,
   materializeUnifiedThreadWindow,
+  resolveUnifiedThreadContentRef,
   type UnifiedThread,
 } from "../src/index";
 
@@ -122,5 +123,167 @@ describe("thread window", () => {
     expect(() =>
       buildUnifiedThreadWindow(duplicateThread, { maxItems: 10 }),
     ).toThrow("duplicate item id item-4");
+  });
+
+  it("moves large command output into a content ref", () => {
+    const output = "large output line\n".repeat(128);
+    const thread = UnifiedThreadSchema.parse({
+      ...buildThread(),
+      turns: [
+        {
+          id: "turn-cmd",
+          status: "completed",
+          items: [
+            {
+              id: "item-cmd",
+              type: "commandExecution",
+              command: "bun test",
+              status: "completed",
+              aggregatedOutput: output,
+              exitCode: 0,
+            },
+          ],
+        },
+      ],
+    });
+    const window = buildUnifiedThreadWindow(thread, {
+      maxItems: 10,
+      contentRefByteLimit: 128,
+    });
+    const item = window.itemsById["item-cmd"];
+
+    expect(item?.type).toBe("commandExecution");
+    if (!item || item.type !== "commandExecution") {
+      throw new Error("Expected command item");
+    }
+
+    expect(item.aggregatedOutput).not.toBe(output);
+    expect(item.aggregatedOutputRef?.kind).toBe("commandOutput");
+    expect(Object.keys(window.contentRefs)).toEqual([
+      item.aggregatedOutputRef?.id,
+    ]);
+
+    if (!item.aggregatedOutputRef) {
+      throw new Error("Expected command output ref");
+    }
+    const resolved = resolveUnifiedThreadContentRef(
+      thread,
+      item.aggregatedOutputRef.id,
+    );
+    expect(resolved.value).toBe(output);
+  });
+
+  it("moves large diffs and tool payloads into content refs", () => {
+    const diff = [
+      "diff --git a/src/app.ts b/src/app.ts",
+      "--- a/src/app.ts",
+      "+++ b/src/app.ts",
+      "@@ -1,1 +1,1 @@",
+      `+${"const value = 1;\n".repeat(32)}`,
+    ].join("\n");
+    const mcpArguments = { code: "console.log('hello');\n".repeat(64) };
+    const dynamicContentItems = [
+      {
+        type: "inputText",
+        text: "dynamic output\n".repeat(64),
+      },
+    ];
+    const thread = UnifiedThreadSchema.parse({
+      ...buildThread(),
+      turns: [
+        {
+          id: "turn-heavy",
+          status: "completed",
+          items: [
+            {
+              id: "item-file",
+              type: "fileChange",
+              status: "completed",
+              changes: [
+                {
+                  path: "src/app.ts",
+                  kind: { type: "modify" },
+                  diff,
+                },
+              ],
+            },
+            {
+              id: "item-mcp",
+              type: "mcpToolCall",
+              server: "node_repl",
+              tool: "js",
+              status: "completed",
+              arguments: mcpArguments,
+              result: {
+                content: [
+                  {
+                    type: "text",
+                    text: "tool result\n".repeat(64),
+                  },
+                ],
+              },
+            },
+            {
+              id: "item-dynamic",
+              type: "dynamicToolCall",
+              tool: "apply_patch",
+              arguments: { patch: "patch body\n".repeat(64) },
+              status: "completed",
+              contentItems: dynamicContentItems,
+              success: true,
+            },
+          ],
+        },
+      ],
+    });
+    const window = buildUnifiedThreadWindow(thread, {
+      maxItems: 10,
+      contentRefByteLimit: 128,
+    });
+    const fileItem = window.itemsById["item-file"];
+    const mcpItem = window.itemsById["item-mcp"];
+    const dynamicItem = window.itemsById["item-dynamic"];
+
+    expect(fileItem?.type).toBe("fileChange");
+    expect(mcpItem?.type).toBe("mcpToolCall");
+    expect(dynamicItem?.type).toBe("dynamicToolCall");
+    if (
+      !fileItem ||
+      fileItem.type !== "fileChange" ||
+      !mcpItem ||
+      mcpItem.type !== "mcpToolCall" ||
+      !dynamicItem ||
+      dynamicItem.type !== "dynamicToolCall"
+    ) {
+      throw new Error("Expected heavy item refs");
+    }
+
+    const fileDiffRef = fileItem.changes[0]?.diffRef;
+    expect(fileDiffRef?.kind).toBe("fileDiff");
+    expect(mcpItem.argumentsRef?.kind).toBe("mcpArguments");
+    expect(mcpItem.resultRef?.kind).toBe("mcpResult");
+    expect(dynamicItem.argumentsRef?.kind).toBe("dynamicArguments");
+    expect(dynamicItem.contentItemsRef?.kind).toBe("dynamicContentItems");
+
+    if (
+      !fileDiffRef ||
+      !mcpItem.argumentsRef ||
+      !mcpItem.resultRef ||
+      !dynamicItem.argumentsRef ||
+      !dynamicItem.contentItemsRef
+    ) {
+      throw new Error("Expected all heavy refs");
+    }
+
+    expect(resolveUnifiedThreadContentRef(thread, fileDiffRef.id).value).toBe(
+      diff,
+    );
+    expect(
+      resolveUnifiedThreadContentRef(thread, mcpItem.argumentsRef.id).value,
+    ).toEqual(mcpArguments);
+    expect(
+      resolveUnifiedThreadContentRef(thread, dynamicItem.contentItemsRef.id)
+        .value,
+    ).toEqual(dynamicContentItems);
   });
 });

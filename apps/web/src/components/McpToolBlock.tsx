@@ -7,7 +7,12 @@ import {
   Wrench,
 } from "lucide-react";
 import { z } from "zod";
-import type { UnifiedItem } from "@farfield/unified-surface";
+import {
+  JsonValueSchema,
+  type JsonValue,
+  type UnifiedContentRef,
+  type UnifiedItem,
+} from "@farfield/unified-surface";
 import { formatDurationSeconds } from "@/lib/tool-call-ui";
 import {
   ToolCallDetailCode,
@@ -18,6 +23,7 @@ import {
 import { ToolCallRow } from "./ToolCallRow";
 
 type McpToolItem = Extract<UnifiedItem, { type: "mcpToolCall" }>;
+type ContentRefLoader = (ref: UnifiedContentRef) => Promise<JsonValue>;
 
 const NodeReplJsArgumentsSchema = z
   .object({
@@ -208,11 +214,17 @@ function statusTextForTool(item: McpToolItem): { text: string; className: string
 function McpToolBlockComponent({
   item,
   className,
+  onLoadContentRef,
 }: {
   item: McpToolItem;
   className?: string;
+  onLoadContentRef: ContentRefLoader;
 }) {
   const [expanded, setExpanded] = useState(item.status === "inProgress");
+  const [loadedArgumentsText, setLoadedArgumentsText] = useState<string | null>(null);
+  const [loadedResultText, setLoadedResultText] = useState<string | null>(null);
+  const [loadingRefIds, setLoadingRefIds] = useState<Record<string, boolean>>({});
+  const [failedRefIds, setFailedRefIds] = useState<Record<string, boolean>>({});
   const lastStatusRef = useRef(item.status);
 
   useEffect(() => {
@@ -222,14 +234,67 @@ function McpToolBlockComponent({
     lastStatusRef.current = item.status;
   }, [item.status]);
 
+  useEffect(() => {
+    const refs: UnifiedContentRef[] = [];
+    if (item.argumentsRef !== undefined) {
+      refs.push(item.argumentsRef);
+    }
+    if (item.resultRef !== undefined) {
+      refs.push(item.resultRef);
+    }
+
+    if (!expanded || refs.length === 0) {
+      return;
+    }
+
+    for (const ref of refs) {
+      const alreadyLoaded =
+        (ref.id === item.argumentsRef?.id && loadedArgumentsText !== null) ||
+        (ref.id === item.resultRef?.id && loadedResultText !== null);
+      if (alreadyLoaded || loadingRefIds[ref.id]) {
+        continue;
+      }
+
+      setLoadingRefIds((current) => ({ ...current, [ref.id]: true }));
+      setFailedRefIds((current) => ({ ...current, [ref.id]: false }));
+      void onLoadContentRef(ref)
+        .then((value) => {
+          const text = JSON.stringify(JsonValueSchema.parse(value), null, 2);
+          if (ref.id === item.argumentsRef?.id) {
+            setLoadedArgumentsText(text);
+          }
+          if (ref.id === item.resultRef?.id) {
+            setLoadedResultText(text);
+          }
+        })
+        .catch(() => {
+          setFailedRefIds((current) => ({ ...current, [ref.id]: true }));
+        })
+        .finally(() => {
+          setLoadingRefIds((current) => ({ ...current, [ref.id]: false }));
+        });
+    }
+  }, [
+    expanded,
+    item.argumentsRef,
+    item.resultRef,
+    loadedArgumentsText,
+    loadedResultText,
+    loadingRefIds,
+    onLoadContentRef,
+  ]);
+
   const ToolIcon = iconForTool(item);
   const title = formatToolTitle(item);
   const details = buildDetailRows(item);
   const nodeCode = codeForNodeRepl(item);
   const textResult = firstTextResult(item);
+  const argumentsRefId = item.argumentsRef?.id ?? null;
+  const resultRefId = item.resultRef?.id ?? null;
   const imageCount = imageResultCount(item);
   const contentCount = resultPartCount(item);
   const statusText = statusTextForTool(item);
+  const hasLazyDetails = item.argumentsRef !== undefined || item.resultRef !== undefined;
 
   return (
     <div className={`${className ?? ""} text-sm`}>
@@ -250,9 +315,32 @@ function McpToolBlockComponent({
           </>
         }
       >
-        {(details.length > 0 || nodeCode || item.error?.message || textResult) && (
+        {(details.length > 0 ||
+          nodeCode ||
+          item.error?.message ||
+          textResult ||
+          hasLazyDetails) && (
           <ToolCallDetails>
           <ToolCallDetailRows rows={details} />
+
+          {argumentsRefId && loadingRefIds[argumentsRefId] && (
+            <ToolCallDetailText>Loading arguments...</ToolCallDetailText>
+          )}
+
+          {argumentsRefId && failedRefIds[argumentsRefId] && (
+            <ToolCallDetailText tone="danger">
+              Could not load arguments.
+            </ToolCallDetailText>
+          )}
+
+          {loadedArgumentsText && (
+            <ToolCallDetailCode
+              label="Arguments"
+              code={loadedArgumentsText}
+              language="json"
+              className="max-h-56 overflow-y-auto"
+            />
+          )}
 
           {nodeCode && (
             <ToolCallDetailCode
@@ -273,6 +361,25 @@ function McpToolBlockComponent({
               label="Result"
               code={textResult}
               language="text"
+              className="max-h-56 overflow-y-auto"
+            />
+          )}
+
+          {resultRefId && loadingRefIds[resultRefId] && (
+            <ToolCallDetailText>Loading result...</ToolCallDetailText>
+          )}
+
+          {resultRefId && failedRefIds[resultRefId] && (
+            <ToolCallDetailText tone="danger">
+              Could not load result.
+            </ToolCallDetailText>
+          )}
+
+          {loadedResultText && (
+            <ToolCallDetailCode
+              label="Result"
+              code={loadedResultText}
+              language="json"
               className="max-h-56 overflow-y-auto"
             />
           )}

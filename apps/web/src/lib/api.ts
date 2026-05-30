@@ -1,5 +1,7 @@
 import {
   UnifiedApprovalThreadRequestSchema,
+  UnifiedContentRefSchema,
+  UnifiedContentRefValueSchema,
   JsonValueSchema,
   UnifiedCollaborationModeSchema,
   UnifiedCommandResponseSchema,
@@ -354,15 +356,17 @@ const AgentsResponseSchema = z
   })
   .strict();
 
+const ThreadListCursorsSchema = z
+  .object({
+    codex: z.string().nullable(),
+    opencode: z.string().nullable(),
+  })
+  .strict();
+
 const ThreadListResponseSchema = z
   .object({
     data: z.array(UnifiedThreadSummarySchema),
-    cursors: z
-      .object({
-        codex: z.string().nullable(),
-        opencode: z.string().nullable(),
-      })
-      .strict(),
+    cursors: ThreadListCursorsSchema,
     errors: z
       .object({
         codex: z.union([UnifiedProviderErrorSchema, z.null()]),
@@ -376,6 +380,7 @@ const SidebarThreadsEnvelopeSchema = z
   .object({
     ok: z.literal(true),
     rows: z.array(UnifiedThreadSummarySchema),
+    cursors: ThreadListCursorsSchema,
     errors: z
       .object({
         codex: z.union([UnifiedProviderErrorSchema, z.null()]),
@@ -386,9 +391,18 @@ const SidebarThreadsEnvelopeSchema = z
   })
   .strict();
 
+const ContentRefEnvelopeSchema = z
+  .object({
+    ok: z.literal(true),
+    ref: UnifiedContentRefSchema,
+    value: JsonValueSchema,
+  })
+  .strict();
+
 const SidebarThreadsResponseSchema = z
   .object({
     rows: z.array(UnifiedThreadSummarySchema),
+    cursors: ThreadListCursorsSchema,
     errors: z
       .object({
         codex: z.union([UnifiedProviderErrorSchema, z.null()]),
@@ -730,15 +744,19 @@ export async function listThreads(options: {
   archived: boolean;
   all: boolean;
   maxPages: number;
-  cursor?: string | null;
+  cursors?: z.infer<typeof ThreadListCursorsSchema>;
 }): Promise<z.infer<typeof ThreadListResponseSchema>> {
   const params = new URLSearchParams();
   params.set("limit", String(options.limit));
   params.set("archived", options.archived ? "1" : "0");
   params.set("all", options.all ? "1" : "0");
   params.set("maxPages", String(options.maxPages));
-  if (typeof options.cursor === "string" && options.cursor.length > 0) {
-    params.set("cursor", options.cursor);
+  const cursors = options.cursors;
+  if (cursors?.codex) {
+    params.set("codexCursor", cursors.codex);
+  }
+  if (cursors?.opencode) {
+    params.set("opencodeCursor", cursors.opencode);
   }
 
   const payload = await requestEnvelope(
@@ -757,15 +775,19 @@ export async function listSidebarThreads(options: {
   archived: boolean;
   all: boolean;
   maxPages: number;
-  cursor?: string | null;
+  cursors?: z.infer<typeof ThreadListCursorsSchema>;
 }): Promise<z.infer<typeof SidebarThreadsResponseSchema>> {
   const params = new URLSearchParams();
   params.set("limit", String(options.limit));
   params.set("archived", options.archived ? "1" : "0");
   params.set("all", options.all ? "1" : "0");
   params.set("maxPages", String(options.maxPages));
-  if (typeof options.cursor === "string" && options.cursor.length > 0) {
-    params.set("cursor", options.cursor);
+  const cursors = options.cursors;
+  if (cursors?.codex) {
+    params.set("codexCursor", cursors.codex);
+  }
+  if (cursors?.opencode) {
+    params.set("opencodeCursor", cursors.opencode);
   }
 
   const payload = await requestEnvelope(
@@ -775,6 +797,7 @@ export async function listSidebarThreads(options: {
 
   return SidebarThreadsResponseSchema.parse({
     rows: payload.rows,
+    cursors: payload.cursors,
     errors: payload.errors,
     refreshing: payload.refreshing ?? false,
   });
@@ -939,6 +962,28 @@ export async function getStreamEvents(
     threadId: result.threadId,
     ownerClientId: result.ownerClientId,
     events: result.events,
+  });
+}
+
+export async function readThreadContentRef(
+  threadId: string,
+  refId: string,
+  options?: { provider?: AgentId },
+): Promise<z.infer<typeof UnifiedContentRefValueSchema>> {
+  const params = new URLSearchParams();
+  if (options?.provider) {
+    params.set("provider", options.provider);
+  }
+
+  const query = params.toString();
+  const payload = await requestEnvelope(
+    `/api/unified/thread/${encodeURIComponent(threadId)}/content/${encodeURIComponent(refId)}${query.length > 0 ? `?${query}` : ""}`,
+    ContentRefEnvelopeSchema,
+  );
+
+  return UnifiedContentRefValueSchema.parse({
+    ref: payload.ref,
+    value: payload.value,
   });
 }
 

@@ -4,6 +4,8 @@ import { z } from "zod";
 const NonEmptyStringSchema = z.string().min(1);
 const NullableStringSchema = z.union([z.string(), z.null()]);
 const NonNegativeIntSchema = z.number().int().nonnegative();
+const DEFAULT_CONTENT_REF_BYTE_LIMIT = 8_192;
+const CONTENT_REF_PREVIEW_MAX_CHARS = 1_200;
 
 export const JsonPrimitiveSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 export type JsonPrimitive = z.infer<typeof JsonPrimitiveSchema>;
@@ -16,6 +18,38 @@ export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
 
 export const UnifiedProviderIdSchema = z.enum(["codex", "opencode"]);
 export type UnifiedProviderId = z.infer<typeof UnifiedProviderIdSchema>;
+
+export const UnifiedContentRefKindSchema = z.enum([
+  "agentText",
+  "reasoningText",
+  "turnDiff",
+  "commandOutput",
+  "fileDiff",
+  "mcpArguments",
+  "mcpResult",
+  "dynamicArguments",
+  "dynamicContentItems"
+]);
+export type UnifiedContentRefKind = z.infer<typeof UnifiedContentRefKindSchema>;
+
+export const UnifiedContentRefSchema = z
+  .object({
+    id: NonEmptyStringSchema,
+    kind: UnifiedContentRefKindSchema,
+    contentType: z.enum(["text", "json"]),
+    byteLength: NonNegativeIntSchema,
+    preview: z.union([z.string(), z.null()])
+  })
+  .strict();
+export type UnifiedContentRef = z.infer<typeof UnifiedContentRefSchema>;
+
+export const UnifiedContentRefValueSchema = z
+  .object({
+    ref: UnifiedContentRefSchema,
+    value: JsonValueSchema
+  })
+  .strict();
+export type UnifiedContentRefValue = z.infer<typeof UnifiedContentRefValueSchema>;
 
 export const UnifiedApprovalPolicySchema = z.enum([
   "untrusted",
@@ -546,7 +580,8 @@ const UnifiedAgentMessageItemSchema = z
   .object({
     id: NonEmptyStringSchema,
     type: z.literal("agentMessage"),
-    text: z.string()
+    text: z.string(),
+    textRef: UnifiedContentRefSchema.optional()
   })
   .strict();
 
@@ -566,7 +601,8 @@ const UnifiedReasoningItemSchema = z
     id: NonEmptyStringSchema,
     type: z.literal("reasoning"),
     summary: z.array(z.string()).optional(),
-    text: z.string().optional()
+    text: z.string().optional(),
+    textRef: UnifiedContentRefSchema.optional()
   })
   .strict();
 
@@ -644,6 +680,7 @@ const UnifiedCommandExecutionItemSchema = z
     status: NonEmptyStringSchema,
     commandActions: z.array(UnifiedCommandActionSchema).optional(),
     aggregatedOutput: z.union([z.string(), z.null()]).optional(),
+    aggregatedOutputRef: UnifiedContentRefSchema.optional(),
     exitCode: z.union([z.number().int(), z.null()]).optional(),
     durationMs: z.union([NonNegativeIntSchema, z.null()]).optional()
   })
@@ -664,7 +701,8 @@ const UnifiedFileChangeItemSchema = z
               movePath: NullableStringSchema.optional()
             })
             .strict(),
-          diff: z.string().optional()
+          diff: z.string().optional(),
+          diffRef: UnifiedContentRefSchema.optional()
         })
         .strict()
     )
@@ -725,6 +763,7 @@ const UnifiedMcpToolCallItemSchema = z
     tool: z.string(),
     status: z.enum(["inProgress", "completed", "failed"]),
     arguments: JsonValueSchema,
+    argumentsRef: UnifiedContentRefSchema.optional(),
     result: z
       .union([
         z
@@ -736,6 +775,7 @@ const UnifiedMcpToolCallItemSchema = z
         z.null()
       ])
       .optional(),
+    resultRef: UnifiedContentRefSchema.optional(),
     error: z
       .union([
         z
@@ -770,6 +810,7 @@ const UnifiedDynamicToolCallItemSchema = z
     type: z.literal("dynamicToolCall"),
     tool: z.string(),
     arguments: JsonValueSchema,
+    argumentsRef: UnifiedContentRefSchema.optional(),
     status: z.enum(["inProgress", "completed", "failed"]),
     contentItems: z
       .union([
@@ -782,6 +823,7 @@ const UnifiedDynamicToolCallItemSchema = z
         z.null()
       ])
       .optional(),
+    contentItemsRef: UnifiedContentRefSchema.optional(),
     success: z.union([z.boolean(), z.null()]).optional(),
     durationMs: z.union([NonNegativeIntSchema, z.null()]).optional()
   })
@@ -928,6 +970,7 @@ export const UnifiedTurnSchema = z
     finalAssistantStartedAtMs: z.union([NonNegativeIntSchema, z.null()]).optional(),
     error: z.union([JsonValueSchema, z.null()]).optional(),
     diff: z.union([JsonValueSchema, z.null()]).optional(),
+    diffRef: UnifiedContentRefSchema.optional(),
     items: z.array(UnifiedItemSchema)
   })
   .strict();
@@ -967,7 +1010,8 @@ export type UnifiedThread = z.infer<typeof UnifiedThreadSchema>;
 
 const UnifiedThreadWindowOptionsSchema = z
   .object({
-    maxItems: z.number().int().positive()
+    maxItems: z.number().int().positive(),
+    contentRefByteLimit: z.number().int().positive().optional()
   })
   .strict();
 export type UnifiedThreadWindowOptions = z.infer<
@@ -999,7 +1043,8 @@ const UnifiedThreadWindowTurnSchema = z
     turnStartedAtMs: z.union([NonNegativeIntSchema, z.null()]).optional(),
     finalAssistantStartedAtMs: z.union([NonNegativeIntSchema, z.null()]).optional(),
     error: z.union([JsonValueSchema, z.null()]).optional(),
-    diff: z.union([JsonValueSchema, z.null()]).optional()
+    diff: z.union([JsonValueSchema, z.null()]).optional(),
+    diffRef: UnifiedContentRefSchema.optional()
   })
   .strict();
 
@@ -1024,12 +1069,147 @@ export const UnifiedThreadWindowSchema = z
     turnOrder: z.array(NonEmptyStringSchema),
     turnsById: z.record(UnifiedThreadWindowTurnSchema),
     itemIdsByTurnId: z.record(z.array(NonEmptyStringSchema)),
-    itemsById: z.record(UnifiedItemSchema)
+    itemsById: z.record(UnifiedItemSchema),
+    contentRefs: z.record(UnifiedContentRefSchema)
   })
   .strict();
 export type UnifiedThreadWindow = z.infer<typeof UnifiedThreadWindowSchema>;
 
-function buildUnifiedThreadWindowTurn(turn: UnifiedTurn) {
+type UnifiedThreadWindowTurn = z.infer<typeof UnifiedThreadWindowTurnSchema>;
+
+function encodeContentRefSegment(value: string): string {
+  return encodeURIComponent(value);
+}
+
+function truncateContentRefPreview(value: string): string {
+  return value.length > CONTENT_REF_PREVIEW_MAX_CHARS
+    ? `${value.slice(0, CONTENT_REF_PREVIEW_MAX_CHARS)}\n...`
+    : value;
+}
+
+function textByteLength(value: string): number {
+  return strToU8(value).length;
+}
+
+function jsonPreview(value: JsonValue): string {
+  return truncateContentRefPreview(JSON.stringify(JsonValueSchema.parse(value)));
+}
+
+function textContentRef(input: {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  field: string;
+  kind: UnifiedContentRefKind;
+  value: string;
+}): UnifiedContentRef {
+  return UnifiedContentRefSchema.parse({
+    id: [
+      "thread",
+      encodeContentRefSegment(input.threadId),
+      "turn",
+      encodeContentRefSegment(input.turnId),
+      "item",
+      encodeContentRefSegment(input.itemId),
+      "field",
+      encodeContentRefSegment(input.field)
+    ].join(":"),
+    kind: input.kind,
+    contentType: "text",
+    byteLength: textByteLength(input.value),
+    preview: truncateContentRefPreview(input.value)
+  });
+}
+
+function jsonContentRef(input: {
+  threadId: string;
+  turnId: string;
+  itemId: string;
+  field: string;
+  kind: UnifiedContentRefKind;
+  value: JsonValue;
+}): UnifiedContentRef {
+  const parsedValue = JsonValueSchema.parse(input.value);
+  return UnifiedContentRefSchema.parse({
+    id: [
+      "thread",
+      encodeContentRefSegment(input.threadId),
+      "turn",
+      encodeContentRefSegment(input.turnId),
+      "item",
+      encodeContentRefSegment(input.itemId),
+      "field",
+      encodeContentRefSegment(input.field)
+    ].join(":"),
+    kind: input.kind,
+    contentType: "json",
+    byteLength: textByteLength(JSON.stringify(parsedValue)),
+    preview: jsonPreview(parsedValue)
+  });
+}
+
+function turnJsonContentRef(input: {
+  threadId: string;
+  turnId: string;
+  field: string;
+  kind: UnifiedContentRefKind;
+  value: JsonValue;
+}): UnifiedContentRef {
+  const parsedValue = JsonValueSchema.parse(input.value);
+  return UnifiedContentRefSchema.parse({
+    id: [
+      "thread",
+      encodeContentRefSegment(input.threadId),
+      "turn",
+      encodeContentRefSegment(input.turnId),
+      "field",
+      encodeContentRefSegment(input.field)
+    ].join(":"),
+    kind: input.kind,
+    contentType: "json",
+    byteLength: textByteLength(JSON.stringify(parsedValue)),
+    preview: jsonPreview(parsedValue)
+  });
+}
+
+function storeContentRef(
+  refs: Record<string, UnifiedContentRef>,
+  ref: UnifiedContentRef
+): void {
+  refs[ref.id] = ref;
+}
+
+function shouldStoreContentRef(
+  ref: UnifiedContentRef,
+  contentRefByteLimit: number
+): boolean {
+  return ref.byteLength > contentRefByteLimit;
+}
+
+function buildUnifiedThreadWindowTurn(
+  threadId: string,
+  turn: UnifiedTurn,
+  contentRefs: Record<string, UnifiedContentRef>,
+  contentRefByteLimit: number
+): UnifiedThreadWindowTurn {
+  const diffRef =
+    turn.diff !== undefined && turn.diff !== null
+      ? turnJsonContentRef({
+          threadId,
+          turnId: turn.id,
+          field: "diff",
+          kind: "turnDiff",
+          value: turn.diff
+        })
+      : null;
+  const storedDiffRef =
+    diffRef && shouldStoreContentRef(diffRef, contentRefByteLimit)
+      ? diffRef
+      : null;
+  if (storedDiffRef) {
+    storeContentRef(contentRefs, storedDiffRef);
+  }
+
   return UnifiedThreadWindowTurnSchema.parse({
     id: turn.id,
     ...(turn.turnId !== undefined ? { turnId: turn.turnId } : {}),
@@ -1041,8 +1221,208 @@ function buildUnifiedThreadWindowTurn(turn: UnifiedTurn) {
       ? { finalAssistantStartedAtMs: turn.finalAssistantStartedAtMs }
       : {}),
     ...(turn.error !== undefined ? { error: turn.error } : {}),
-    ...(turn.diff !== undefined ? { diff: turn.diff } : {})
+    ...(turn.diff !== undefined
+      ? { diff: storedDiffRef ? storedDiffRef.preview : turn.diff }
+      : {}),
+    ...(storedDiffRef ? { diffRef: storedDiffRef } : {})
   });
+}
+
+function buildUnifiedThreadWindowItem(input: {
+  threadId: string;
+  turnId: string;
+  item: UnifiedItem;
+  contentRefs: Record<string, UnifiedContentRef>;
+  contentRefByteLimit: number;
+}): UnifiedItem {
+  const contentRefInput = {
+    threadId: input.threadId,
+    turnId: input.turnId,
+    itemId: input.item.id
+  };
+
+  switch (input.item.type) {
+    case "agentMessage": {
+      const ref = textContentRef({
+        ...contentRefInput,
+        field: "text",
+        kind: "agentText",
+        value: input.item.text
+      });
+      if (!shouldStoreContentRef(ref, input.contentRefByteLimit)) {
+        return input.item;
+      }
+      storeContentRef(input.contentRefs, ref);
+      return UnifiedItemSchema.parse({
+        ...input.item,
+        text: ref.preview ?? "",
+        textRef: ref
+      });
+    }
+    case "reasoning": {
+      if (input.item.text === undefined) {
+        return input.item;
+      }
+      const ref = textContentRef({
+        ...contentRefInput,
+        field: "text",
+        kind: "reasoningText",
+        value: input.item.text
+      });
+      if (!shouldStoreContentRef(ref, input.contentRefByteLimit)) {
+        return input.item;
+      }
+      storeContentRef(input.contentRefs, ref);
+      return UnifiedItemSchema.parse({
+        ...input.item,
+        text: ref.preview ?? "",
+        textRef: ref
+      });
+    }
+    case "commandExecution": {
+      if (input.item.aggregatedOutput === undefined || input.item.aggregatedOutput === null) {
+        return input.item;
+      }
+      const ref = textContentRef({
+        ...contentRefInput,
+        field: "aggregatedOutput",
+        kind: "commandOutput",
+        value: input.item.aggregatedOutput
+      });
+      if (!shouldStoreContentRef(ref, input.contentRefByteLimit)) {
+        return input.item;
+      }
+      storeContentRef(input.contentRefs, ref);
+      return UnifiedItemSchema.parse({
+        ...input.item,
+        aggregatedOutput: ref.preview,
+        aggregatedOutputRef: ref
+      });
+    }
+    case "fileChange": {
+      const changes = input.item.changes.map((change, index) => {
+        if (change.diff === undefined) {
+          return change;
+        }
+        const ref = textContentRef({
+          ...contentRefInput,
+          field: `changes.${index}.diff`,
+          kind: "fileDiff",
+          value: change.diff
+        });
+        if (!shouldStoreContentRef(ref, input.contentRefByteLimit)) {
+          return change;
+        }
+        storeContentRef(input.contentRefs, ref);
+        return {
+          ...change,
+          diff: ref.preview ?? "",
+          diffRef: ref
+        };
+      });
+      return UnifiedItemSchema.parse({
+        ...input.item,
+        changes
+      });
+    }
+    case "mcpToolCall": {
+      const argumentsRef = jsonContentRef({
+        ...contentRefInput,
+        field: "arguments",
+        kind: "mcpArguments",
+        value: input.item.arguments
+      });
+      const storedArgumentsRef = shouldStoreContentRef(
+        argumentsRef,
+        input.contentRefByteLimit
+      )
+        ? argumentsRef
+        : null;
+      if (storedArgumentsRef) {
+        storeContentRef(input.contentRefs, storedArgumentsRef);
+      }
+
+      const resultRef =
+        input.item.result !== undefined && input.item.result !== null
+          ? jsonContentRef({
+              ...contentRefInput,
+              field: "result",
+              kind: "mcpResult",
+              value: JsonValueSchema.parse(input.item.result)
+            })
+          : null;
+      const storedResultRef =
+        resultRef && shouldStoreContentRef(resultRef, input.contentRefByteLimit)
+          ? resultRef
+          : null;
+      if (storedResultRef) {
+        storeContentRef(input.contentRefs, storedResultRef);
+      }
+
+      if (!storedArgumentsRef && !storedResultRef) {
+        return input.item;
+      }
+
+      return UnifiedItemSchema.parse({
+        ...input.item,
+        ...(storedArgumentsRef
+          ? { arguments: null, argumentsRef: storedArgumentsRef }
+          : {}),
+        ...(storedResultRef ? { result: null, resultRef: storedResultRef } : {})
+      });
+    }
+    case "dynamicToolCall": {
+      const argumentsRef = jsonContentRef({
+        ...contentRefInput,
+        field: "arguments",
+        kind: "dynamicArguments",
+        value: input.item.arguments
+      });
+      const storedArgumentsRef = shouldStoreContentRef(
+        argumentsRef,
+        input.contentRefByteLimit
+      )
+        ? argumentsRef
+        : null;
+      if (storedArgumentsRef) {
+        storeContentRef(input.contentRefs, storedArgumentsRef);
+      }
+
+      const contentItemsRef =
+        input.item.contentItems !== undefined && input.item.contentItems !== null
+          ? jsonContentRef({
+              ...contentRefInput,
+              field: "contentItems",
+              kind: "dynamicContentItems",
+              value: JsonValueSchema.parse(input.item.contentItems)
+            })
+          : null;
+      const storedContentItemsRef =
+        contentItemsRef &&
+        shouldStoreContentRef(contentItemsRef, input.contentRefByteLimit)
+          ? contentItemsRef
+          : null;
+      if (storedContentItemsRef) {
+        storeContentRef(input.contentRefs, storedContentItemsRef);
+      }
+
+      if (!storedArgumentsRef && !storedContentItemsRef) {
+        return input.item;
+      }
+
+      return UnifiedItemSchema.parse({
+        ...input.item,
+        ...(storedArgumentsRef
+          ? { arguments: null, argumentsRef: storedArgumentsRef }
+          : {}),
+        ...(storedContentItemsRef
+          ? { contentItems: null, contentItemsRef: storedContentItemsRef }
+          : {})
+      });
+    }
+    default:
+      return input.item;
+  }
 }
 
 export function buildUnifiedThreadWindow(
@@ -1051,6 +1431,8 @@ export function buildUnifiedThreadWindow(
 ): UnifiedThreadWindow {
   const parsedThread = UnifiedThreadSchema.parse(thread);
   const parsedOptions = UnifiedThreadWindowOptionsSchema.parse(options);
+  const contentRefByteLimit =
+    parsedOptions.contentRefByteLimit ?? DEFAULT_CONTENT_REF_BYTE_LIMIT;
   const totalTurns = parsedThread.turns.length;
   const totalItems = parsedThread.turns.reduce(
     (sum, turn) => sum + turn.items.length,
@@ -1083,9 +1465,10 @@ export function buildUnifiedThreadWindow(
   const startTurnIndex = totalTurns - selectedTurns.length;
   const endTurnIndexExclusive = totalTurns;
   const turnOrder: string[] = [];
-  const turnsById: Record<string, z.infer<typeof UnifiedThreadWindowTurnSchema>> = {};
+  const turnsById: Record<string, UnifiedThreadWindowTurn> = {};
   const itemIdsByTurnId: Record<string, string[]> = {};
   const itemsById: Record<string, UnifiedItem> = {};
+  const contentRefs: Record<string, UnifiedContentRef> = {};
 
   for (const turn of selectedTurns) {
     if (turnsById[turn.id]) {
@@ -1093,14 +1476,25 @@ export function buildUnifiedThreadWindow(
     }
 
     turnOrder.push(turn.id);
-    turnsById[turn.id] = buildUnifiedThreadWindowTurn(turn);
+    turnsById[turn.id] = buildUnifiedThreadWindowTurn(
+      parsedThread.id,
+      turn,
+      contentRefs,
+      contentRefByteLimit
+    );
     const itemIds: string[] = [];
 
     for (const item of turn.items) {
       if (itemsById[item.id]) {
         throw new Error(`Thread ${parsedThread.id} has duplicate item id ${item.id}`);
       }
-      itemsById[item.id] = item;
+      itemsById[item.id] = buildUnifiedThreadWindowItem({
+        threadId: parsedThread.id,
+        turnId: turn.id,
+        item,
+        contentRefs,
+        contentRefByteLimit
+      });
       itemIds.push(item.id);
     }
 
@@ -1142,7 +1536,8 @@ export function buildUnifiedThreadWindow(
     turnOrder,
     turnsById,
     itemIdsByTurnId,
-    itemsById
+    itemsById,
+    contentRefs
   });
 }
 
@@ -1185,6 +1580,7 @@ export function materializeUnifiedThreadWindow(
         : {}),
       ...(turn.error !== undefined ? { error: turn.error } : {}),
       ...(turn.diff !== undefined ? { diff: turn.diff } : {}),
+      ...(turn.diffRef !== undefined ? { diffRef: turn.diffRef } : {}),
       items
     });
   });
@@ -1212,6 +1608,202 @@ export function materializeUnifiedThreadWindow(
       ? { source: parsedWindow.meta.source }
       : {})
   });
+}
+
+function matchContentRefValue(
+  refId: string,
+  ref: UnifiedContentRef,
+  value: JsonValue
+): UnifiedContentRefValue | null {
+  if (ref.id !== refId) {
+    return null;
+  }
+
+  return UnifiedContentRefValueSchema.parse({
+    ref,
+    value
+  });
+}
+
+export function resolveUnifiedThreadContentRef(
+  thread: UnifiedThread,
+  refId: string
+): UnifiedContentRefValue {
+  const parsedThread = UnifiedThreadSchema.parse(thread);
+
+  for (const turn of parsedThread.turns) {
+    if (turn.diff !== undefined && turn.diff !== null) {
+      const matched = matchContentRefValue(
+        refId,
+        turnJsonContentRef({
+          threadId: parsedThread.id,
+          turnId: turn.id,
+          field: "diff",
+          kind: "turnDiff",
+          value: turn.diff
+        }),
+        turn.diff
+      );
+      if (matched) {
+        return matched;
+      }
+    }
+
+    for (const item of turn.items) {
+      const contentRefInput = {
+        threadId: parsedThread.id,
+        turnId: turn.id,
+        itemId: item.id
+      };
+
+      switch (item.type) {
+        case "agentMessage": {
+          const matched = matchContentRefValue(
+            refId,
+            textContentRef({
+              ...contentRefInput,
+              field: "text",
+              kind: "agentText",
+              value: item.text
+            }),
+            item.text
+          );
+          if (matched) {
+            return matched;
+          }
+          break;
+        }
+        case "reasoning": {
+          if (item.text === undefined) {
+            break;
+          }
+          const matched = matchContentRefValue(
+            refId,
+            textContentRef({
+              ...contentRefInput,
+              field: "text",
+              kind: "reasoningText",
+              value: item.text
+            }),
+            item.text
+          );
+          if (matched) {
+            return matched;
+          }
+          break;
+        }
+        case "commandExecution": {
+          if (item.aggregatedOutput === undefined || item.aggregatedOutput === null) {
+            break;
+          }
+          const matched = matchContentRefValue(
+            refId,
+            textContentRef({
+              ...contentRefInput,
+              field: "aggregatedOutput",
+              kind: "commandOutput",
+              value: item.aggregatedOutput
+            }),
+            item.aggregatedOutput
+          );
+          if (matched) {
+            return matched;
+          }
+          break;
+        }
+        case "fileChange": {
+          for (let index = 0; index < item.changes.length; index += 1) {
+            const change = item.changes[index];
+            if (!change || change.diff === undefined) {
+              continue;
+            }
+            const matched = matchContentRefValue(
+              refId,
+              textContentRef({
+                ...contentRefInput,
+                field: `changes.${index}.diff`,
+                kind: "fileDiff",
+                value: change.diff
+              }),
+              change.diff
+            );
+            if (matched) {
+              return matched;
+            }
+          }
+          break;
+        }
+        case "mcpToolCall": {
+          const matchedArguments = matchContentRefValue(
+            refId,
+            jsonContentRef({
+              ...contentRefInput,
+              field: "arguments",
+              kind: "mcpArguments",
+              value: item.arguments
+            }),
+            item.arguments
+          );
+          if (matchedArguments) {
+            return matchedArguments;
+          }
+
+          if (item.result !== undefined && item.result !== null) {
+            const matchedResult = matchContentRefValue(
+              refId,
+              jsonContentRef({
+                ...contentRefInput,
+                field: "result",
+                kind: "mcpResult",
+                value: JsonValueSchema.parse(item.result)
+              }),
+              JsonValueSchema.parse(item.result)
+            );
+            if (matchedResult) {
+              return matchedResult;
+            }
+          }
+          break;
+        }
+        case "dynamicToolCall": {
+          const matchedArguments = matchContentRefValue(
+            refId,
+            jsonContentRef({
+              ...contentRefInput,
+              field: "arguments",
+              kind: "dynamicArguments",
+              value: item.arguments
+            }),
+            item.arguments
+          );
+          if (matchedArguments) {
+            return matchedArguments;
+          }
+
+          if (item.contentItems !== undefined && item.contentItems !== null) {
+            const matchedContentItems = matchContentRefValue(
+              refId,
+              jsonContentRef({
+                ...contentRefInput,
+                field: "contentItems",
+                kind: "dynamicContentItems",
+                value: JsonValueSchema.parse(item.contentItems)
+              }),
+              JsonValueSchema.parse(item.contentItems)
+            );
+            if (matchedContentItems) {
+              return matchedContentItems;
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+
+  throw new Error(`Thread ${parsedThread.id} does not contain content ref ${refId}`);
 }
 
 export const UnifiedThreadSummarySchema = z
@@ -1771,6 +2363,12 @@ export const UnifiedRealtimeCoreStateSchema = z
     sidebar: z
       .object({
         rows: z.array(UnifiedThreadSummarySchema),
+        cursors: z
+          .object({
+            codex: z.union([z.string(), z.null()]),
+            opencode: z.union([z.string(), z.null()])
+          })
+          .strict(),
         errors: UnifiedRealtimeSidebarErrorsSchema,
         refreshing: z.boolean().optional()
       })
@@ -1949,6 +2547,8 @@ const UNIFIED_BINARY_VALUE_NUMBER = 3;
 const UNIFIED_BINARY_VALUE_STRING = 4;
 const UNIFIED_BINARY_VALUE_ARRAY = 5;
 const UNIFIED_BINARY_VALUE_OBJECT = 6;
+const UNIFIED_BINARY_VALUE_STRING_TABLE = 7;
+const UNIFIED_BINARY_VALUE_STRING_REF = 8;
 
 const UnifiedRealtimeProtobufFrameHeaderSchema = z
   .object({
@@ -2041,9 +2641,69 @@ export function decodeUnifiedPayloadFrame(
 }
 
 function encodeUnifiedBinaryValue(value: JsonValue): Uint8Array {
+  const stringTable = buildUnifiedBinaryStringTable(value);
   const bytes: number[] = [];
-  writeUnifiedBinaryValue(value, bytes);
+  if (stringTable.length > 0) {
+    const stringIds = new Map<string, number>();
+    for (let index = 0; index < stringTable.length; index += 1) {
+      const tableValue = stringTable[index];
+      if (tableValue !== undefined) {
+        stringIds.set(tableValue, index);
+      }
+    }
+
+    bytes.push(UNIFIED_BINARY_VALUE_STRING_TABLE);
+    writeProtobufVarint(stringTable.length, bytes);
+    for (const tableValue of stringTable) {
+      writeUnifiedBinaryBytes(strToU8(tableValue), bytes);
+    }
+    writeUnifiedBinaryValueWithStringTable(value, bytes, stringIds);
+  } else {
+    writeUnifiedBinaryValue(value, bytes);
+  }
   return new Uint8Array(bytes);
+}
+
+function buildUnifiedBinaryStringTable(value: JsonValue): string[] {
+  const counts = new Map<string, number>();
+  collectUnifiedBinaryStrings(value, counts);
+  return [...counts.entries()]
+    .filter((entry) => entry[1] > 1 && textByteLength(entry[0]) > 0)
+    .map((entry) => entry[0]);
+}
+
+function collectUnifiedBinaryStrings(
+  value: JsonValue,
+  counts: Map<string, number>
+): void {
+  const stringValue = z.string().safeParse(value);
+  if (stringValue.success) {
+    incrementUnifiedBinaryStringCount(counts, stringValue.data);
+    return;
+  }
+
+  const arrayValue = z.array(JsonValueSchema).safeParse(value);
+  if (arrayValue.success) {
+    for (const item of arrayValue.data) {
+      collectUnifiedBinaryStrings(item, counts);
+    }
+    return;
+  }
+
+  const objectValue = z.record(JsonValueSchema).safeParse(value);
+  if (objectValue.success) {
+    for (const [key, item] of Object.entries(objectValue.data)) {
+      incrementUnifiedBinaryStringCount(counts, key);
+      collectUnifiedBinaryStrings(item, counts);
+    }
+  }
+}
+
+function incrementUnifiedBinaryStringCount(
+  counts: Map<string, number>,
+  value: string
+): void {
+  counts.set(value, (counts.get(value) ?? 0) + 1);
 }
 
 function writeUnifiedBinaryValue(value: JsonValue, bytes: number[]): void {
@@ -2104,6 +2764,83 @@ function writeUnifiedBinaryValue(value: JsonValue, bytes: number[]): void {
   JsonValueSchema.parse(value);
 }
 
+function writeUnifiedBinaryValueWithStringTable(
+  value: JsonValue,
+  bytes: number[],
+  stringIds: Map<string, number>
+): void {
+  const nullValue = z.null().safeParse(value);
+  if (nullValue.success) {
+    bytes.push(UNIFIED_BINARY_VALUE_NULL);
+    return;
+  }
+
+  const booleanValue = z.boolean().safeParse(value);
+  if (booleanValue.success) {
+    bytes.push(
+      booleanValue.data
+        ? UNIFIED_BINARY_VALUE_TRUE
+        : UNIFIED_BINARY_VALUE_FALSE
+    );
+    return;
+  }
+
+  const numberValue = z.number().safeParse(value);
+  if (numberValue.success) {
+    bytes.push(UNIFIED_BINARY_VALUE_NUMBER);
+    const buffer = new ArrayBuffer(8);
+    new DataView(buffer).setFloat64(0, numberValue.data);
+    bytes.push(...new Uint8Array(buffer));
+    return;
+  }
+
+  const stringValue = z.string().safeParse(value);
+  if (stringValue.success) {
+    writeUnifiedBinaryStringToken(stringValue.data, bytes, stringIds);
+    return;
+  }
+
+  const arrayValue = z.array(JsonValueSchema).safeParse(value);
+  if (arrayValue.success) {
+    bytes.push(UNIFIED_BINARY_VALUE_ARRAY);
+    writeProtobufVarint(arrayValue.data.length, bytes);
+    for (const item of arrayValue.data) {
+      writeUnifiedBinaryValueWithStringTable(item, bytes, stringIds);
+    }
+    return;
+  }
+
+  const objectValue = z.record(JsonValueSchema).safeParse(value);
+  if (objectValue.success) {
+    const entries = Object.entries(objectValue.data);
+    bytes.push(UNIFIED_BINARY_VALUE_OBJECT);
+    writeProtobufVarint(entries.length, bytes);
+    for (const [key, item] of entries) {
+      writeUnifiedBinaryStringToken(key, bytes, stringIds);
+      writeUnifiedBinaryValueWithStringTable(item, bytes, stringIds);
+    }
+    return;
+  }
+
+  JsonValueSchema.parse(value);
+}
+
+function writeUnifiedBinaryStringToken(
+  value: string,
+  bytes: number[],
+  stringIds: Map<string, number>
+): void {
+  const stringId = stringIds.get(value);
+  if (stringId !== undefined) {
+    bytes.push(UNIFIED_BINARY_VALUE_STRING_REF);
+    writeProtobufVarint(stringId, bytes);
+    return;
+  }
+
+  bytes.push(UNIFIED_BINARY_VALUE_STRING);
+  writeUnifiedBinaryBytes(strToU8(value), bytes);
+}
+
 function writeUnifiedBinaryBytes(value: Uint8Array, bytes: number[]): void {
   writeProtobufVarint(value.length, bytes);
   for (const byte of value) {
@@ -2113,6 +2850,20 @@ function writeUnifiedBinaryBytes(value: Uint8Array, bytes: number[]): void {
 
 function decodeUnifiedBinaryValue(bytes: Uint8Array): JsonValue {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (bytes[0] === UNIFIED_BINARY_VALUE_STRING_TABLE) {
+    const tableResult = readUnifiedBinaryStringTable(view, bytes, 1);
+    const result = readUnifiedBinaryValueWithStringTable(
+      view,
+      bytes,
+      tableResult.next,
+      tableResult.value
+    );
+    if (result.next !== bytes.length) {
+      throw new Error("Unified binary payload has trailing bytes");
+    }
+    return result.value;
+  }
+
   const result = readUnifiedBinaryValue(view, bytes, 0);
   if (result.next !== bytes.length) {
     throw new Error("Unified binary payload has trailing bytes");
@@ -2189,6 +2940,149 @@ function readUnifiedBinaryValue(
   }
 
   throw new Error(`Unsupported unified binary value tag ${tag}`);
+}
+
+function readUnifiedBinaryStringTable(
+  view: DataView,
+  bytes: Uint8Array,
+  cursor: number
+): { value: string[]; next: number } {
+  const lengthResult = readProtobufVarint(view, cursor);
+  const value: string[] = [];
+  let next = lengthResult.next;
+  for (let index = 0; index < lengthResult.value; index += 1) {
+    const itemResult = readUnifiedBinaryBytes(bytes, next);
+    value.push(strFromU8(itemResult.value));
+    next = itemResult.next;
+  }
+  return { value, next };
+}
+
+function readUnifiedBinaryValueWithStringTable(
+  view: DataView,
+  bytes: Uint8Array,
+  cursor: number,
+  stringTable: readonly string[]
+): { value: JsonValue; next: number } {
+  if (cursor >= bytes.length) {
+    throw new Error("Unexpected end of unified binary value");
+  }
+
+  const tag = bytes[cursor];
+  const valueCursor = cursor + 1;
+
+  if (tag === UNIFIED_BINARY_VALUE_NULL) {
+    return { value: null, next: valueCursor };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_FALSE) {
+    return { value: false, next: valueCursor };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_TRUE) {
+    return { value: true, next: valueCursor };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_NUMBER) {
+    const next = valueCursor + 8;
+    if (next > bytes.length) {
+      throw new Error("Unified binary number exceeds payload size");
+    }
+    return {
+      value: view.getFloat64(valueCursor),
+      next
+    };
+  }
+
+  if (
+    tag === UNIFIED_BINARY_VALUE_STRING ||
+    tag === UNIFIED_BINARY_VALUE_STRING_REF
+  ) {
+    return readUnifiedBinaryStringToken(
+      view,
+      bytes,
+      cursor,
+      stringTable
+    );
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_ARRAY) {
+    const lengthResult = readProtobufVarint(view, valueCursor);
+    const value: JsonValue[] = [];
+    let next = lengthResult.next;
+    for (let index = 0; index < lengthResult.value; index += 1) {
+      const itemResult = readUnifiedBinaryValueWithStringTable(
+        view,
+        bytes,
+        next,
+        stringTable
+      );
+      value.push(itemResult.value);
+      next = itemResult.next;
+    }
+    return { value, next };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_OBJECT) {
+    const lengthResult = readProtobufVarint(view, valueCursor);
+    const value: Record<string, JsonValue> = {};
+    let next = lengthResult.next;
+    for (let index = 0; index < lengthResult.value; index += 1) {
+      const keyResult = readUnifiedBinaryStringToken(
+        view,
+        bytes,
+        next,
+        stringTable
+      );
+      const itemResult = readUnifiedBinaryValueWithStringTable(
+        view,
+        bytes,
+        keyResult.next,
+        stringTable
+      );
+      value[keyResult.value] = itemResult.value;
+      next = itemResult.next;
+    }
+    return { value, next };
+  }
+
+  throw new Error(`Unsupported unified binary value tag ${tag}`);
+}
+
+function readUnifiedBinaryStringToken(
+  view: DataView,
+  bytes: Uint8Array,
+  cursor: number,
+  stringTable: readonly string[]
+): { value: string; next: number } {
+  if (cursor >= bytes.length) {
+    throw new Error("Unexpected end of unified binary string token");
+  }
+
+  const tag = bytes[cursor];
+  const valueCursor = cursor + 1;
+
+  if (tag === UNIFIED_BINARY_VALUE_STRING) {
+    const valueResult = readUnifiedBinaryBytes(bytes, valueCursor);
+    return {
+      value: strFromU8(valueResult.value),
+      next: valueResult.next
+    };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_STRING_REF) {
+    const valueResult = readProtobufVarint(view, valueCursor);
+    const value = stringTable[valueResult.value];
+    if (value === undefined) {
+      throw new Error(`Unified binary string ref ${valueResult.value} is invalid`);
+    }
+    return {
+      value,
+      next: valueResult.next
+    };
+  }
+
+  throw new Error(`Unsupported unified binary string token ${tag}`);
 }
 
 function readUnifiedBinaryBytes(

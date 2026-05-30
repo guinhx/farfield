@@ -1,5 +1,10 @@
 import React, { memo, useState } from "react";
 import { FilePlus, FileMinus, FileEdit } from "lucide-react";
+import { z } from "zod";
+import type {
+  JsonValue,
+  UnifiedContentRef,
+} from "@farfield/unified-surface";
 import { languageFromPath } from "@/lib/code-language";
 import { CodeSnippet } from "./CodeSnippet";
 import { ToolCallRow } from "./ToolCallRow";
@@ -8,11 +13,14 @@ interface FileChange {
   path: string;
   kind: { type: string; movePath?: string | null | undefined };
   diff?: string | undefined;
+  diffRef?: UnifiedContentRef | undefined;
 }
 
 interface DiffBlockProps {
   changes: FileChange[];
+  onLoadContentRef?: (ref: UnifiedContentRef) => Promise<JsonValue>;
 }
+const LoadedTextSchema = z.string();
 
 type LineType = "add" | "remove" | "header" | "context";
 interface DiffLine {
@@ -77,10 +85,13 @@ const GUTTER_CHAR: Record<LineType, string> = {
   context: " ",
 };
 
-function DiffBlockComponent({ changes }: DiffBlockProps) {
+function DiffBlockComponent({ changes, onLoadContentRef }: DiffBlockProps) {
   const [expandedIdx, setExpandedIdx] = useState<number | null>(
     changes.length > 0 && changes[0]?.diff == null ? 0 : null,
   );
+  const [loadedDiffs, setLoadedDiffs] = useState<Record<string, string>>({});
+  const [loadingDiffRefId, setLoadingDiffRefId] = useState<string | null>(null);
+  const [failedDiffRefId, setFailedDiffRefId] = useState<string | null>(null);
   const lastDiffLengthRef = React.useRef(changes[0]?.diff?.length ?? 0);
 
   React.useEffect(() => {
@@ -95,13 +106,55 @@ function DiffBlockComponent({ changes }: DiffBlockProps) {
     }
   }, [changes]);
 
+  React.useEffect(() => {
+    if (expandedIdx === null) {
+      return;
+    }
+
+    const change = changes[expandedIdx];
+    const ref = change?.diffRef;
+    if (
+      !ref ||
+      !onLoadContentRef ||
+      loadedDiffs[ref.id] !== undefined ||
+      loadingDiffRefId === ref.id
+    ) {
+      return;
+    }
+
+    setLoadingDiffRefId(ref.id);
+    setFailedDiffRefId(null);
+    void onLoadContentRef(ref)
+      .then((value) => {
+        setLoadedDiffs((current) => ({
+          ...current,
+          [ref.id]: LoadedTextSchema.parse(value),
+        }));
+      })
+      .catch(() => {
+        setFailedDiffRefId(ref.id);
+      })
+      .finally(() => {
+        setLoadingDiffRefId(null);
+      });
+  }, [
+    changes,
+    expandedIdx,
+    loadedDiffs,
+    loadingDiffRefId,
+    onLoadContentRef,
+  ]);
+
   return (
     <div className="text-sm">
       {changes.map((change, i) => {
         const isExpanded = expandedIdx === i;
         const fileName = change.path.split("/").pop() ?? change.path;
         const dirPath = change.path.slice(0, change.path.lastIndexOf("/"));
-        const lines = change.diff ? parseDiff(change.diff) : [];
+        const refId = change.diffRef?.id ?? null;
+        const loadedDiff = refId ? loadedDiffs[refId] : undefined;
+        const displayDiff = loadedDiff ?? change.diff;
+        const lines = displayDiff ? parseDiff(displayDiff) : [];
         const previewLanguage = languageFromPath(change.path);
         const added = lines.filter((line) => line.type === "add").length;
         const removed = lines.filter((line) => line.type === "remove").length;
@@ -134,7 +187,15 @@ function DiffBlockComponent({ changes }: DiffBlockProps) {
               onToggle={() => setExpandedIdx(isExpanded ? null : i)}
             >
                   <div className="overflow-x-auto">
-                    {change.diff ? (
+                    {loadingDiffRefId === refId ? (
+                      <div className="px-3 py-2 text-xs text-muted-foreground">
+                        Loading diff...
+                      </div>
+                    ) : failedDiffRefId === refId ? (
+                      <div className="px-3 py-2 text-xs text-danger">
+                        Could not load diff.
+                      </div>
+                    ) : displayDiff ? (
                       lines.map((line, j) => (
                         <div
                           key={j}
@@ -179,7 +240,10 @@ function areDiffBlockPropsEqual(
   prev: DiffBlockProps,
   next: DiffBlockProps,
 ): boolean {
-  return prev.changes === next.changes;
+  return (
+    prev.changes === next.changes &&
+    prev.onLoadContentRef === next.onLoadContentRef
+  );
 }
 
 export const DiffBlock = memo(DiffBlockComponent, areDiffBlockPropsEqual);

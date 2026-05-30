@@ -45,6 +45,7 @@ import {
   getStreamEvents,
   getUnifiedWebSocketUrl,
   readThread,
+  readThreadContentRef,
   getTraceStatus,
   interruptThread,
   listAgents,
@@ -78,6 +79,8 @@ import {
 import {
   UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP,
   materializeUnifiedThreadWindow,
+  type JsonValue,
+  type UnifiedContentRef,
   type UnifiedRealtimeCoreState,
   type UnifiedRealtimeServerMessage,
   type UnifiedRealtimeThreadState,
@@ -138,6 +141,7 @@ type PendingApprovalRequest = ReturnType<typeof getPendingApprovalRequests>[numb
 type PendingThreadRequest = ReturnType<typeof getPendingThreadRequests>[number];
 type PendingRequestId = PendingRequest["id"];
 type Thread = SidebarThreadsResponse["rows"][number];
+type ThreadListCursors = SidebarThreadsResponse["cursors"];
 type ThreadListProviderErrors = SidebarThreadsResponse["errors"];
 type AgentDescriptor = AgentsResponse["agents"][number];
 type SteeringPromptQueueStatus = "pending" | "sending" | "failed";
@@ -282,6 +286,7 @@ function collectThreadProviderCandidates(input: {
 
 interface AppViewSnapshot {
   threads: SidebarThreadsResponse["rows"];
+  sidebarCursors: ThreadListCursors;
   threadListErrors: ThreadListProviderErrors;
   selectedThreadId: string | null;
   liveState: LiveStateResponse | null;
@@ -660,6 +665,32 @@ function mergeIncomingThreads(
   return sortThreadsByRecency(merged);
 }
 
+function mergeThreadPage(
+  previousThreads: Thread[],
+  incomingThreads: Thread[],
+): Thread[] {
+  const byId = new Map(previousThreads.map((thread) => [thread.id, thread]));
+
+  for (const thread of incomingThreads) {
+    const previous = byId.get(thread.id);
+    const merged = mergeIncomingThreads([thread], previous ? [previous] : []);
+    byId.set(thread.id, merged[0] ?? thread);
+  }
+
+  return sortThreadsByRecency([...byId.values()]);
+}
+
+function emptyThreadListCursors(): ThreadListCursors {
+  return {
+    codex: null,
+    opencode: null,
+  };
+}
+
+function hasThreadListCursor(cursors: ThreadListCursors): boolean {
+  return cursors.codex !== null || cursors.opencode !== null;
+}
+
 function toErrorMessage(err: unknown): string {
   if (err instanceof Error) {
     return err.message;
@@ -879,6 +910,7 @@ const INITIAL_VISIBLE_CHAT_ITEMS = 90;
 const VISIBLE_CHAT_ITEMS_STEP = 80;
 const DEFAULT_THREAD_WINDOW_ITEM_LIMIT =
   INITIAL_VISIBLE_CHAT_ITEMS + VISIBLE_CHAT_ITEMS_STEP;
+const SIDEBAR_THREAD_PAGE_LIMIT = 80;
 const APP_DEFAULT_VALUE = "__app_default__";
 const ASSUMED_APP_DEFAULT_EFFORT = "medium";
 const AGENT_CACHE_TTL_MS = 30_000;
@@ -1477,6 +1509,9 @@ export function App(): React.JSX.Element {
   const [threads, setThreads] = useState<SidebarThreadsResponse["rows"]>(
     initialSnapshot?.threads ?? [],
   );
+  const [sidebarCursors, setSidebarCursors] = useState<ThreadListCursors>(
+    initialSnapshot?.sidebarCursors ?? emptyThreadListCursors(),
+  );
   const [threadListErrors, setThreadListErrors] =
     useState<ThreadListProviderErrors>(
       initialSnapshot?.threadListErrors ?? {
@@ -1512,6 +1547,7 @@ export function App(): React.JSX.Element {
   >([]);
   const [isCoreLoading, setIsCoreLoading] = useState(initialSnapshot === null);
   const [isSidebarRefreshing, setIsSidebarRefreshing] = useState(false);
+  const [isSidebarPageLoading, setIsSidebarPageLoading] = useState(false);
   const [isSelectedThreadLoading, setIsSelectedThreadLoading] = useState(
     initialSnapshot === null && initialUiState.threadId !== null,
   );
@@ -1617,6 +1653,7 @@ export function App(): React.JSX.Element {
         ])
       : new Map(),
   );
+  const contentRefValueCacheRef = useRef<Map<string, JsonValue>>(new Map());
   const agentCacheRef = useRef<AgentCacheEntry | null>(null);
   const providerCatalogCacheRef = useRef<
     Map<AgentId, ProviderCatalogCacheEntry>
@@ -1799,6 +1836,7 @@ export function App(): React.JSX.Element {
 
     return allGroups;
   }, [agentDescriptors, projectColors, sidebarOrder, threads]);
+  const canLoadMoreSidebarThreads = hasThreadListCursor(sidebarCursors);
   const activeLiveState = useMemo(
     () => (liveState?.threadId === selectedThreadId ? liveState : null),
     [liveState, selectedThreadId],
@@ -2274,6 +2312,27 @@ export function App(): React.JSX.Element {
     }
     scroller.scrollTop = scroller.scrollHeight;
   }, []);
+  const loadContentRef = useCallback(
+    async (ref: UnifiedContentRef): Promise<JsonValue> => {
+      const threadId = selectedThreadIdRef.current;
+      if (!threadId) {
+        throw new Error("No selected thread for content ref");
+      }
+
+      const cacheKey = `${threadId}:${ref.id}:${ref.byteLength}`;
+      const cached = contentRefValueCacheRef.current.get(cacheKey);
+      if (cached !== undefined) {
+        return cached;
+      }
+
+      const result = await readThreadContentRef(threadId, ref.id, {
+        provider: activeThreadAgentId,
+      });
+      contentRefValueCacheRef.current.set(cacheKey, result.value);
+      return result.value;
+    },
+    [activeThreadAgentId],
+  );
   const closeMobileSidebar = useCallback(() => {
     setMobileSidebarOpen(false);
     setMobileSidebarDragOffset(null);
@@ -2338,7 +2397,7 @@ export function App(): React.JSX.Element {
 
     const healthPromise = getHealth();
     const sidebarPromise = listSidebarThreads({
-      limit: 80,
+      limit: SIDEBAR_THREAD_PAGE_LIMIT,
       archived: false,
       all: false,
       maxPages: 1,
@@ -2352,6 +2411,7 @@ export function App(): React.JSX.Element {
 
     const nt = await sidebarPromise;
     setIsSidebarRefreshing(nt.refreshing ?? false);
+    setSidebarCursors(nt.cursors);
     const incomingThreads = sortThreadsByRecency(nt.rows);
     const optimisticSelectedThreadIds = optimisticSelectedThreadIdsRef.current;
     if (optimisticSelectedThreadIds.size > 0) {
@@ -2926,6 +2986,55 @@ export function App(): React.JSX.Element {
     });
   }, [activeThreadWindow, loadSelectedThread, visibleChatItemLimit]);
 
+  const loadMoreSidebarThreads = useCallback(async () => {
+    if (!hasThreadListCursor(sidebarCursors) || isSidebarPageLoading) {
+      return;
+    }
+
+    setIsSidebarPageLoading(true);
+    try {
+      const nextPage = await listSidebarThreads({
+        limit: SIDEBAR_THREAD_PAGE_LIMIT,
+        archived: false,
+        all: false,
+        maxPages: 1,
+        cursors: sidebarCursors,
+      });
+      setIsSidebarRefreshing(nextPage.refreshing ?? false);
+      setSidebarCursors((previous) =>
+        nextPage.refreshing && !hasThreadListCursor(nextPage.cursors)
+          ? previous
+          : nextPage.cursors,
+      );
+      setThreadListErrors((prev) =>
+        hasSameThreadListErrors(prev, nextPage.errors)
+          ? prev
+          : nextPage.errors,
+      );
+
+      const incomingThreads = sortThreadsByRecency(nextPage.rows);
+      const nextThreadProviders = new Map(threadProviderByIdRef.current);
+      for (const thread of incomingThreads) {
+        nextThreadProviders.set(thread.id, thread.provider);
+      }
+      threadProviderByIdRef.current = nextThreadProviders;
+
+      setThreads((previousThreads) => {
+        const nextThreads = mergeThreadPage(previousThreads, incomingThreads);
+        const nextSignature = buildThreadsSignature(nextThreads);
+        if (signaturesMatch(threadsSignatureRef.current, nextSignature)) {
+          return previousThreads;
+        }
+        threadsSignatureRef.current = nextSignature;
+        return nextThreads;
+      });
+    } catch (e) {
+      setError(toErrorMessage(e));
+    } finally {
+      setIsSidebarPageLoading(false);
+    }
+  }, [isSidebarPageLoading, sidebarCursors]);
+
   const refreshAll = useCallback(async () => {
     try {
       setError("");
@@ -2993,6 +3102,7 @@ export function App(): React.JSX.Element {
           : coreState.sidebar.errors,
       );
       setIsSidebarRefreshing(coreState.sidebar.refreshing ?? false);
+      setSidebarCursors(coreState.sidebar.cursors);
 
       setThreads((previousThreads) => {
         const nextThreads = mergeIncomingThreads(
@@ -3657,6 +3767,7 @@ export function App(): React.JSX.Element {
     }
     appViewSnapshotCache = {
       threads,
+      sidebarCursors,
       threadListErrors,
       selectedThreadId,
       liveState,
@@ -3677,6 +3788,7 @@ export function App(): React.JSX.Element {
     readThreadState,
     selectedAgentId,
     selectedThreadId,
+    sidebarCursors,
     streamEvents,
     threadListErrors,
     threads,
@@ -4947,6 +5059,24 @@ export function App(): React.JSX.Element {
                 </div>
               );
             })}
+            {canLoadMoreSidebarThreads && (
+              <div className="px-2 pt-1">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="h-8 w-full justify-center gap-2 rounded-lg text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                  disabled={isSidebarPageLoading}
+                  onClick={() => {
+                    void loadMoreSidebarThreads();
+                  }}
+                >
+                  {isSidebarPageLoading && (
+                    <Loader2 size={12} className="animate-spin" />
+                  )}
+                  Load more threads
+                </Button>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -5488,6 +5618,7 @@ export function App(): React.JSX.Element {
                   visibleConversationItems={visibleConversationItems}
                   isChatAtBottom={isChatAtBottom}
                   onSelectThread={handleSelectReferencedThread}
+                  onLoadContentRef={loadContentRef}
                   onShowOlder={showOlderChatItems}
                   onScrollToBottom={() => {
                     scrollChatToBottom();

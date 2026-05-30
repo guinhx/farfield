@@ -6,7 +6,12 @@ import {
   FileText,
   FileSearch,
 } from "lucide-react";
-import type { UnifiedItem } from "@farfield/unified-surface";
+import { z } from "zod";
+import type {
+  JsonValue,
+  UnifiedContentRef,
+  UnifiedItem,
+} from "@farfield/unified-surface";
 import { summarizeCommandForHeader } from "@/lib/command-action-ui";
 import { formatDurationSeconds } from "@/lib/tool-call-ui";
 import {
@@ -17,6 +22,8 @@ import {
 import { ToolCallRow } from "./ToolCallRow";
 
 type CommandItem = Extract<UnifiedItem, { type: "commandExecution" }>;
+type ContentRefLoader = (ref: UnifiedContentRef) => Promise<JsonValue>;
+const LoadedTextSchema = z.string();
 
 const ACTION_ICONS: Record<string, React.ElementType> = {
   search: Search,
@@ -30,10 +37,18 @@ const ACTION_ICONS: Record<string, React.ElementType> = {
 interface CommandBlockProps {
   item: CommandItem;
   isActive: boolean;
+  onLoadContentRef: ContentRefLoader;
 }
 
-function CommandBlockComponent({ item, isActive }: CommandBlockProps) {
+function CommandBlockComponent({
+  item,
+  isActive,
+  onLoadContentRef,
+}: CommandBlockProps) {
   const [expanded, setExpanded] = useState(item.status === "inProgress");
+  const [loadedOutput, setLoadedOutput] = useState<string | null>(null);
+  const [isLoadingOutput, setIsLoadingOutput] = useState(false);
+  const [outputLoadFailed, setOutputLoadFailed] = useState(false);
   const lastStatusRef = React.useRef(item.status);
 
   React.useEffect(() => {
@@ -42,11 +57,37 @@ function CommandBlockComponent({ item, isActive }: CommandBlockProps) {
     }
     lastStatusRef.current = item.status;
   }, [item.status]);
+
+  React.useEffect(() => {
+    const ref = item.aggregatedOutputRef;
+    if (!expanded || !ref || loadedOutput !== null || isLoadingOutput) {
+      return;
+    }
+
+    setIsLoadingOutput(true);
+    setOutputLoadFailed(false);
+    void onLoadContentRef(ref)
+      .then((value) => {
+        setLoadedOutput(LoadedTextSchema.parse(value));
+      })
+      .catch(() => {
+        setOutputLoadFailed(true);
+      })
+      .finally(() => {
+        setIsLoadingOutput(false);
+      });
+  }, [
+    expanded,
+    isLoadingOutput,
+    item.aggregatedOutputRef,
+    loadedOutput,
+    onLoadContentRef,
+  ]);
+
   const isCompleted = item.status === "completed";
   const isSuccess = item.exitCode === 0 || item.exitCode == null;
-  const output =
-    typeof item.aggregatedOutput === "string" ? item.aggregatedOutput : "";
-  const hasOutput = output.trim().length > 0;
+  const output = loadedOutput ?? item.aggregatedOutput ?? "";
+  const hasOutput = output.trim().length > 0 || item.aggregatedOutputRef !== undefined;
   const headerSegments = summarizeCommandForHeader(item.command, item.commandActions);
   const displayedHeaderSegments = headerSegments.slice(0, 3);
   const hiddenHeaderSegmentsCount = Math.max(headerSegments.length - 3, 0);
@@ -103,7 +144,13 @@ function CommandBlockComponent({ item, isActive }: CommandBlockProps) {
             code={item.command}
             language="bash"
           />
-          {hasOutput ? (
+          {isLoadingOutput ? (
+            <ToolCallDetailText>Loading output...</ToolCallDetailText>
+          ) : outputLoadFailed ? (
+            <ToolCallDetailText tone="danger">
+              Could not load output.
+            </ToolCallDetailText>
+          ) : hasOutput ? (
             <ToolCallDetailCode
               label="Output"
               code={output}

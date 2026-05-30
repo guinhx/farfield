@@ -96,6 +96,10 @@ function buildLargeRealtimeMessage(): UnifiedRealtimeServerMessage {
             source: "codex"
           }
         ],
+        cursors: {
+          codex: null,
+          opencode: null
+        },
         errors: {
           codex: null,
           opencode: null

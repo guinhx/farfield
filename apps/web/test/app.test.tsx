@@ -542,6 +542,10 @@ function buildRealtimeCoreStateFixture(
     },
     sidebar: {
       rows,
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
       errors: {
         codex: null,
         opencode: null,
@@ -750,6 +754,7 @@ vi.stubGlobal(
       return jsonResponse({
         ok: true,
         rows: threadsFixture.data,
+        cursors: threadsFixture.cursors,
         errors: threadsFixture.errors,
       });
     }
@@ -875,6 +880,87 @@ describe("App", () => {
     });
     expect(countFetchCalls("/api/health")).toBe(1);
     expect(countFetchCalls("/api/account/rate-limits")).toBe(0);
+  });
+
+  it("loads additional sidebar pages with provider cursors", async () => {
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: "thread-page-1",
+          provider: "codex",
+          preview: "first page thread",
+          title: "first page thread",
+          createdAt: 1,
+          updatedAt: 2,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: "next-cursor",
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "project" }));
+    expect(
+      (await screen.findAllByText("first page thread")).length,
+    ).toBeGreaterThan(0);
+
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: "thread-page-2",
+          provider: "codex",
+          preview: "second page thread",
+          title: "second page thread",
+          createdAt: 1,
+          updatedAt: 1,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Load more threads" }),
+    );
+
+    expect(
+      (await screen.findAllByText("second page thread")).length,
+    ).toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Load more threads" }),
+      ).toBeNull();
+    });
+    const sidebarCalls = vi.mocked(fetch).mock.calls.filter(([input]) => {
+      return (
+        new URL(String(input), "http://localhost").pathname ===
+        "/api/unified/sidebar"
+      );
+    });
+    const lastSidebarUrl = new URL(
+      String(sidebarCalls[sidebarCalls.length - 1]?.[0]),
+      "http://localhost",
+    );
+    expect(lastSidebarUrl.searchParams.get("codexCursor")).toBe("next-cursor");
   });
 
   it("shows a provider connection state when sidebar listing is disconnected", async () => {

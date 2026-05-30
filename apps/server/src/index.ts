@@ -25,6 +25,7 @@ import {
   UnifiedRealtimeCoreStateSchema,
   UnifiedRealtimeThreadStateSchema,
   encodeUnifiedPayloadFrame,
+  resolveUnifiedThreadContentRef,
   type JsonValue,
   type UnifiedEventKind,
   type UnifiedFeatureAvailability,
@@ -222,6 +223,20 @@ function parseBoolean(value: string | null, fallback: boolean): boolean {
   }
 
   return fallback;
+}
+
+function parseThreadListCursors(url: URL): Record<UnifiedProviderId, string | null> {
+  const sharedCursor = url.searchParams.get("cursor") ?? null;
+  return {
+    codex: url.searchParams.get("codexCursor") ?? sharedCursor,
+    opencode: url.searchParams.get("opencodeCursor") ?? sharedCursor,
+  };
+}
+
+function hasThreadListCursor(
+  cursors: Record<UnifiedProviderId, string | null>,
+): boolean {
+  return cursors.codex !== null || cursors.opencode !== null;
 }
 
 const ThreadWindowItemLimitQuerySchema = z
@@ -539,6 +554,7 @@ interface UnifiedListThreadsResponse {
 
 interface UnifiedSidebarResponse {
   rows: UnifiedThreadSummary[];
+  cursors: Record<UnifiedProviderId, string | null>;
   errors: Record<UnifiedProviderId, ProviderErrorPayload | null>;
   refreshing?: boolean;
 }
@@ -548,7 +564,7 @@ interface UnifiedThreadListInput {
   archived: boolean;
   all: boolean;
   maxPages: number;
-  cursor: string | null;
+  cursors: Record<UnifiedProviderId, string | null>;
 }
 
 interface SidebarCacheEntry {
@@ -808,7 +824,7 @@ async function listUnifiedThreads(
           archived: input.archived,
           all: input.all,
           maxPages: input.maxPages,
-          cursor: input.cursor,
+          cursor: input.cursors[provider],
         });
 
         cursors[provider] = result.nextCursor ?? null;
@@ -853,6 +869,7 @@ async function listUnifiedSidebarThreads(
       ...thread,
       preview: compactSidebarPreview(thread.preview),
     })),
+    cursors: result.cursors,
     errors: result.errors,
     refreshing: false,
   };
@@ -864,13 +881,18 @@ function buildSidebarCacheKey(input: UnifiedThreadListInput): string {
     input.archived ? "archived" : "active",
     input.all ? "all" : "recent",
     String(input.maxPages),
-    input.cursor ?? "",
+    input.cursors.codex ?? "",
+    input.cursors.opencode ?? "",
   ].join(":");
 }
 
 function buildEmptySidebarResponse(): UnifiedSidebarResponse {
   return {
     rows: [],
+    cursors: {
+      codex: null,
+      opencode: null,
+    },
     errors: {
       codex: null,
       opencode: null,
@@ -944,6 +966,10 @@ function startSidebarRefresh(
       }
       return {
         rows: [],
+        cursors: {
+          codex: null,
+          opencode: null,
+        },
         errors: {
           codex: {
             code: "listThreadsFailed",
@@ -1015,7 +1041,10 @@ async function buildRealtimeCoreState() {
             archived: false,
             all: false,
             maxPages: 1,
-            cursor: null,
+            cursors: {
+              codex: null,
+              opencode: null,
+            },
           },
           { waitForInitial: false },
         ),
@@ -1655,13 +1684,13 @@ const server = http.createServer(async (req, res) => {
       const archived = parseBoolean(url.searchParams.get("archived"), false);
       const all = parseBoolean(url.searchParams.get("all"), false);
       const maxPages = parseInteger(url.searchParams.get("maxPages"), 20);
-      const cursor = url.searchParams.get("cursor") ?? null;
+      const cursors = parseThreadListCursors(url);
       const result = await listUnifiedThreads({
         limit,
         archived,
         all,
         maxPages,
-        cursor,
+        cursors,
       });
       jsonResponse(res, 200, {
         ok: true,
@@ -1677,23 +1706,146 @@ const server = http.createServer(async (req, res) => {
       const archived = parseBoolean(url.searchParams.get("archived"), false);
       const all = parseBoolean(url.searchParams.get("all"), false);
       const maxPages = parseInteger(url.searchParams.get("maxPages"), 20);
-      const cursor = url.searchParams.get("cursor") ?? null;
+      const cursors = parseThreadListCursors(url);
       const result = await listUnifiedSidebarThreadsShared(
         {
           limit,
           archived,
           all,
           maxPages,
-          cursor,
+          cursors,
         },
-        { waitForInitial: false },
+        { waitForInitial: hasThreadListCursor(cursors) },
       );
       jsonResponse(res, 200, {
         ok: true,
         rows: result.rows,
+        cursors: result.cursors,
         errors: result.errors,
         refreshing: result.refreshing ?? false,
       });
+      return;
+    }
+
+    if (
+      req.method === "GET" &&
+      segments[0] === "api" &&
+      segments[1] === "unified" &&
+      segments[2] === "thread" &&
+      segments[3] &&
+      segments[4] === "content" &&
+      segments[5]
+    ) {
+      const threadId = decodeURIComponent(segments[3]);
+      const contentRefId = decodeURIComponent(segments[5]);
+      const rawProvider = url.searchParams.get("provider");
+      const providerFromQuery = parseUnifiedProviderId(rawProvider);
+      if (rawProvider !== null && providerFromQuery === null) {
+        jsonResponse(res, 400, {
+          ok: false,
+          error: {
+            code: "invalidProvider",
+            message: `Provider ${rawProvider} is not supported`,
+            details: {
+              provider: rawProvider,
+            },
+          },
+        });
+        return;
+      }
+
+      const knownProviders = threadIndex.providers(threadId);
+      const resolvedProvider = threadIndex.resolve(threadId);
+      let provider = providerFromQuery ?? resolvedProvider;
+      let discoveredThread: UnifiedThread | null = null;
+
+      if (!provider) {
+        if (knownProviders.length > 1) {
+          jsonResponse(res, 409, {
+            ok: false,
+            error: {
+              code: "threadProviderAmbiguous",
+              message: `Thread ${threadId} exists in multiple providers; provider query is required`,
+              details: {
+                threadId,
+                providers: knownProviders,
+              },
+            },
+          });
+          return;
+        }
+
+        const discoveredMatches = await discoverUnifiedThreads({
+          threadId,
+          includeTurns: true,
+        });
+        if (discoveredMatches.length > 1) {
+          jsonResponse(res, 409, {
+            ok: false,
+            error: {
+              code: "threadProviderAmbiguous",
+              message: `Thread ${threadId} exists in multiple providers; provider query is required`,
+              details: {
+                threadId,
+                providers: discoveredMatches.map((match) => match.provider),
+              },
+            },
+          });
+          return;
+        }
+
+        if (discoveredMatches.length === 1) {
+          provider = discoveredMatches[0]?.provider ?? null;
+          discoveredThread = discoveredMatches[0]?.thread ?? null;
+        }
+      }
+
+      if (!provider) {
+        jsonResponse(res, 404, {
+          ok: false,
+          error: {
+            code: "threadNotFound",
+            message: `Thread ${threadId} is not registered`,
+            details: {
+              threadId,
+            },
+          },
+        });
+        return;
+      }
+
+      try {
+        const thread =
+          discoveredThread && discoveredThread.provider === provider
+            ? discoveredThread
+            : await readUnifiedThreadDirect({
+                provider,
+                threadId,
+                includeTurns: true,
+              });
+        const resolved = resolveUnifiedThreadContentRef(thread, contentRefId);
+
+        threadIndex.register(thread.id, thread.provider);
+        jsonResponse(res, 200, {
+          ok: true,
+          ref: resolved.ref,
+          value: resolved.value,
+        });
+      } catch (error) {
+        const message = toErrorMessage(error);
+        jsonResponse(res, 404, {
+          ok: false,
+          error: {
+            code: "contentRefNotFound",
+            message,
+            details: {
+              provider,
+              threadId,
+              contentRefId,
+            },
+          },
+        });
+      }
       return;
     }
 
