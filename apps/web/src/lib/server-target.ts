@@ -2,6 +2,7 @@ import { z } from "zod";
 
 const STORAGE_KEY = "farfield.server-target.v1";
 const DEFAULT_SERVER_PORT = 4311;
+const DEV_WEB_PORT = "4312";
 
 const ServerProtocolSchema = z.enum(["http:", "https:"]);
 
@@ -74,26 +75,45 @@ const ApiPathSchema = z
 
 export type StoredServerTarget = z.infer<typeof StoredServerTargetSchema>;
 
+interface BrowserLocationLike {
+  origin: string;
+  hostname: string;
+  port: string;
+}
+
 function isLocalHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
 }
 
-export function getDefaultServerBaseUrl(): string {
-  if (typeof window === "undefined") {
-    return `http://127.0.0.1:${String(DEFAULT_SERVER_PORT)}`;
-  }
-
-  const hostname = window.location.hostname;
+export function resolveDefaultServerBaseUrlFromLocation(
+  location: BrowserLocationLike,
+): string {
+  const hostname = location.hostname;
 
   if (isLocalHost(hostname)) {
     return `http://127.0.0.1:${String(DEFAULT_SERVER_PORT)}`;
   }
 
-  return window.location.origin;
+  if (location.port === DEV_WEB_PORT) {
+    const url = new URL(location.origin);
+    url.port = String(DEFAULT_SERVER_PORT);
+    return url.toString().replace(/\/$/, "");
+  }
+
+  return location.origin;
+}
+
+export function getDefaultServerBaseUrl(): string {
+  const browserLocation = globalThis.window?.location ?? null;
+  if (!browserLocation) {
+    return `http://127.0.0.1:${String(DEFAULT_SERVER_PORT)}`;
+  }
+
+  return resolveDefaultServerBaseUrlFromLocation(browserLocation);
 }
 
 export function readStoredServerTarget(): StoredServerTarget | null {
-  if (typeof window === "undefined") {
+  if (!globalThis.window) {
     return null;
   }
 
@@ -117,7 +137,7 @@ export function saveServerBaseUrl(value: string): StoredServerTarget {
     baseUrl: parsedBaseUrl,
   };
 
-  if (typeof window !== "undefined") {
+  if (globalThis.window) {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   }
 
@@ -125,7 +145,7 @@ export function saveServerBaseUrl(value: string): StoredServerTarget {
 }
 
 export function clearStoredServerTarget(): void {
-  if (typeof window === "undefined") {
+  if (!globalThis.window) {
     return;
   }
   window.localStorage.removeItem(STORAGE_KEY);
@@ -134,6 +154,14 @@ export function clearStoredServerTarget(): void {
 export function resolveServerBaseUrl(): string {
   const stored = readStoredServerTarget();
   if (stored) {
+    const browserLocation = globalThis.window?.location ?? null;
+    if (
+      browserLocation &&
+      stored.baseUrl === browserLocation.origin &&
+      browserLocation.port === DEV_WEB_PORT
+    ) {
+      return resolveDefaultServerBaseUrlFromLocation(browserLocation);
+    }
     return stored.baseUrl;
   }
   return getDefaultServerBaseUrl();

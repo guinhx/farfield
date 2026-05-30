@@ -5,6 +5,7 @@ import { Textarea } from "@/components/ui/textarea";
 
 type ChatComposerProps = {
   canSend: boolean;
+  canInterrupt: boolean;
   isBusy: boolean;
   isGenerating: boolean;
   placeholder?: string;
@@ -14,6 +15,7 @@ type ChatComposerProps = {
 
 export function ChatComposer({
   canSend,
+  canInterrupt,
   isBusy,
   isGenerating,
   placeholder = "Message Codex…",
@@ -76,22 +78,38 @@ export function ChatComposer({
   }, []);
 
   const sendDraft = useCallback(async () => {
-    if (isGenerating) {
+    const trimmedDraft = draft.trim();
+    if (isGenerating && !trimmedDraft) {
+      if (!canInterrupt || isBusy) {
+        return;
+      }
       await onInterrupt();
       return;
     }
-    if (!draft.trim() || !canSend || isBusy) {
+    if (!trimmedDraft || !canSend || (!isGenerating && isBusy)) {
       return;
     }
 
     await onSend(draft);
     setDraft("");
     previousHeightRef.current = 0;
-  }, [canSend, draft, isBusy, isGenerating, onInterrupt, onSend]);
+  }, [
+    canInterrupt,
+    canSend,
+    draft,
+    isBusy,
+    isGenerating,
+    onInterrupt,
+    onSend,
+  ]);
 
+  const trimmedDraft = draft.trim();
+  const sendLabel = isGenerating ? (trimmedDraft ? "Steer" : "Stop") : "Send";
   const disableSend = isGenerating
-    ? !canSend || isBusy
-    : !canSend || isBusy || !draft.trim();
+    ? trimmedDraft
+      ? !canSend
+      : !canInterrupt || isBusy
+    : !canSend || isBusy || !trimmedDraft;
   const shouldSendOnEnter = useCallback(() => {
     if (typeof window.matchMedia !== "function") {
       return true;
@@ -129,16 +147,16 @@ export function ChatComposer({
           void sendDraft();
         }}
         disabled={disableSend}
-        title={isGenerating ? "Stop" : "Send"}
-        aria-label={isGenerating ? "Stop" : "Send"}
+        title={sendLabel}
+        aria-label={sendLabel}
         size="icon"
         className={`h-9 w-9 shrink-0 self-end rounded-full disabled:opacity-30 ${
-          isGenerating
+          isGenerating && !trimmedDraft
             ? "bg-white text-black hover:bg-white/90"
             : "bg-foreground text-background hover:bg-foreground/80"
         }`}
       >
-        {isGenerating ? (
+        {isGenerating && !trimmedDraft ? (
           <span className="block h-2.5 w-2.5 rounded-[2px] bg-current" />
         ) : isBusy ? (
           <Loader2 size={13} className="animate-spin" />

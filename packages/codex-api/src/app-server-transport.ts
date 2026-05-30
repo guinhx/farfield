@@ -58,6 +58,13 @@ export interface ChildProcessAppServerTransportOptions {
   optOutNotificationMethods?: string[];
 }
 
+export function shouldUseShellForAppServerTransport(
+  executablePath: string,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  return platform === "win32" && !executablePath.toLowerCase().endsWith(".exe");
+}
+
 function toErrorMessage(error: Error | string): string {
   if (error instanceof Error) {
     return error.message;
@@ -157,6 +164,9 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     }
 
     this.resetStdoutFrameState();
+    const shouldUseShell = shouldUseShellForAppServerTransport(
+      this.executablePath
+    );
 
     const child = spawn(this.executablePath, ["app-server"], {
       cwd: this.cwd,
@@ -166,7 +176,7 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
         CODEX_USER_AGENT: this.userAgent,
         CODEX_CLIENT_ID: `farfield-${randomUUID()}`
       },
-      shell: process.platform === "win32",
+      shell: shouldUseShell,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true
     });

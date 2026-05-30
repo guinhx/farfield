@@ -30,6 +30,38 @@ interface ChatTimelineProps {
   chatContentRef: React.RefObject<HTMLDivElement | null>;
 }
 
+function ChatThreadSkeleton(): React.JSX.Element {
+  return (
+    <div data-testid="thread-loading-skeleton" className="space-y-5 py-2 animate-pulse">
+      <div className="ml-auto w-[82%] space-y-2">
+        <div className="h-4 w-24 rounded bg-muted/70" />
+        <div className="rounded-lg border border-border/70 bg-muted/35 p-3 space-y-2">
+          <div className="h-3.5 w-full rounded bg-muted" />
+          <div className="h-3.5 w-4/5 rounded bg-muted" />
+        </div>
+      </div>
+      <div className="w-full space-y-3">
+        <div className="h-4 w-28 rounded bg-muted/70" />
+        <div className="space-y-2">
+          <div className="h-3.5 w-full rounded bg-muted" />
+          <div className="h-3.5 w-[92%] rounded bg-muted" />
+          <div className="h-3.5 w-[74%] rounded bg-muted" />
+        </div>
+        <div className="rounded-md border border-border/70 bg-muted/25 p-3 space-y-2">
+          <div className="h-3 w-1/3 rounded bg-muted" />
+          <div className="h-3 w-full rounded bg-muted/80" />
+          <div className="h-3 w-2/3 rounded bg-muted/80" />
+        </div>
+      </div>
+      <div className="w-full space-y-2">
+        <div className="h-4 w-32 rounded bg-muted/70" />
+        <div className="h-3.5 w-full rounded bg-muted" />
+        <div className="h-3.5 w-3/4 rounded bg-muted" />
+      </div>
+    </div>
+  );
+}
+
 export const ChatTimeline = memo(function ChatTimeline({
   selectedThreadId,
   isLoading,
@@ -66,19 +98,17 @@ export const ChatTimeline = memo(function ChatTimeline({
             className="max-w-3xl mx-auto px-4 pt-4 pb-6"
           >
             {turnsLength === 0 ? (
-              <div className="text-center py-20 text-sm text-muted-foreground">
-                {isLoading ? (
-                  <span className="reasoning-shimmer font-medium">
-                    Loading thread...
-                  </span>
-                ) : selectedThreadId ? (
-                  "No messages yet"
-                ) : hasAnyAgent ? (
-                  "Start typing to create a new thread"
-                ) : (
-                  "Select a thread from the sidebar"
-                )}
-              </div>
+              isLoading ? (
+                <ChatThreadSkeleton />
+              ) : (
+                <div className="text-center py-20 text-sm text-muted-foreground">
+                  {selectedThreadId
+                    ? "No messages yet"
+                    : hasAnyAgent
+                      ? "Start typing to create a new thread"
+                      : "Select a thread from the sidebar"}
+                </div>
+              )
             ) : (
               <motion.div
                 ref={chatContentRef}

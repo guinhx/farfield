@@ -1,3 +1,4 @@
+import { gzipSync, gunzipSync, strFromU8, strToU8 } from "fflate";
 import { z } from "zod";
 
 const NonEmptyStringSchema = z.string().min(1);
@@ -964,6 +965,255 @@ export const UnifiedThreadSchema = z
   .strict();
 export type UnifiedThread = z.infer<typeof UnifiedThreadSchema>;
 
+const UnifiedThreadWindowOptionsSchema = z
+  .object({
+    maxItems: z.number().int().positive()
+  })
+  .strict();
+export type UnifiedThreadWindowOptions = z.infer<
+  typeof UnifiedThreadWindowOptionsSchema
+>;
+
+const UnifiedThreadWindowMetaSchema = z
+  .object({
+    id: NonEmptyStringSchema,
+    provider: UnifiedProviderIdSchema,
+    requests: z.array(UnifiedThreadRequestSchema),
+    createdAt: NonNegativeIntSchema.optional(),
+    updatedAt: NonNegativeIntSchema.optional(),
+    title: NullableStringSchema.optional(),
+    latestCollaborationMode: z.union([UnifiedLatestCollaborationModeSchema, z.null()]),
+    latestModel: NullableStringSchema,
+    latestReasoningEffort: NullableStringSchema,
+    latestTokenUsageInfo: z.union([JsonValueSchema, z.null()]).optional(),
+    cwd: z.string().optional(),
+    source: z.string().optional()
+  })
+  .strict();
+
+const UnifiedThreadWindowTurnSchema = z
+  .object({
+    id: NonEmptyStringSchema,
+    turnId: z.union([NonEmptyStringSchema, z.null()]).optional(),
+    status: NonEmptyStringSchema,
+    turnStartedAtMs: z.union([NonNegativeIntSchema, z.null()]).optional(),
+    finalAssistantStartedAtMs: z.union([NonNegativeIntSchema, z.null()]).optional(),
+    error: z.union([JsonValueSchema, z.null()]).optional(),
+    diff: z.union([JsonValueSchema, z.null()]).optional()
+  })
+  .strict();
+
+const UnifiedThreadWindowRangeSchema = z
+  .object({
+    totalTurns: z.number().int().nonnegative(),
+    totalItems: z.number().int().nonnegative(),
+    startTurnIndex: z.number().int().nonnegative(),
+    endTurnIndexExclusive: z.number().int().nonnegative(),
+    includedTurnCount: z.number().int().nonnegative(),
+    includedItemCount: z.number().int().nonnegative(),
+    maxItems: z.number().int().positive(),
+    hasMoreBefore: z.boolean(),
+    hasMoreAfter: z.boolean()
+  })
+  .strict();
+
+export const UnifiedThreadWindowSchema = z
+  .object({
+    meta: UnifiedThreadWindowMetaSchema,
+    range: UnifiedThreadWindowRangeSchema,
+    turnOrder: z.array(NonEmptyStringSchema),
+    turnsById: z.record(UnifiedThreadWindowTurnSchema),
+    itemIdsByTurnId: z.record(z.array(NonEmptyStringSchema)),
+    itemsById: z.record(UnifiedItemSchema)
+  })
+  .strict();
+export type UnifiedThreadWindow = z.infer<typeof UnifiedThreadWindowSchema>;
+
+function buildUnifiedThreadWindowTurn(turn: UnifiedTurn) {
+  return UnifiedThreadWindowTurnSchema.parse({
+    id: turn.id,
+    ...(turn.turnId !== undefined ? { turnId: turn.turnId } : {}),
+    status: turn.status,
+    ...(turn.turnStartedAtMs !== undefined
+      ? { turnStartedAtMs: turn.turnStartedAtMs }
+      : {}),
+    ...(turn.finalAssistantStartedAtMs !== undefined
+      ? { finalAssistantStartedAtMs: turn.finalAssistantStartedAtMs }
+      : {}),
+    ...(turn.error !== undefined ? { error: turn.error } : {}),
+    ...(turn.diff !== undefined ? { diff: turn.diff } : {})
+  });
+}
+
+export function buildUnifiedThreadWindow(
+  thread: UnifiedThread,
+  options: UnifiedThreadWindowOptions
+): UnifiedThreadWindow {
+  const parsedThread = UnifiedThreadSchema.parse(thread);
+  const parsedOptions = UnifiedThreadWindowOptionsSchema.parse(options);
+  const totalTurns = parsedThread.turns.length;
+  const totalItems = parsedThread.turns.reduce(
+    (sum, turn) => sum + turn.items.length,
+    0
+  );
+  const selectedTurns: UnifiedTurn[] = [];
+  let includedItemCount = 0;
+
+  for (let index = totalTurns - 1; index >= 0; index -= 1) {
+    const turn = parsedThread.turns[index];
+    if (!turn) {
+      throw new Error(`Thread ${parsedThread.id} has a missing turn at ${index}`);
+    }
+    const nextItemCount = includedItemCount + turn.items.length;
+    if (
+      selectedTurns.length > 0 &&
+      nextItemCount > parsedOptions.maxItems
+    ) {
+      break;
+    }
+
+    selectedTurns.unshift(turn);
+    includedItemCount = nextItemCount;
+
+    if (includedItemCount >= parsedOptions.maxItems) {
+      break;
+    }
+  }
+
+  const startTurnIndex = totalTurns - selectedTurns.length;
+  const endTurnIndexExclusive = totalTurns;
+  const turnOrder: string[] = [];
+  const turnsById: Record<string, z.infer<typeof UnifiedThreadWindowTurnSchema>> = {};
+  const itemIdsByTurnId: Record<string, string[]> = {};
+  const itemsById: Record<string, UnifiedItem> = {};
+
+  for (const turn of selectedTurns) {
+    if (turnsById[turn.id]) {
+      throw new Error(`Thread ${parsedThread.id} has duplicate turn id ${turn.id}`);
+    }
+
+    turnOrder.push(turn.id);
+    turnsById[turn.id] = buildUnifiedThreadWindowTurn(turn);
+    const itemIds: string[] = [];
+
+    for (const item of turn.items) {
+      if (itemsById[item.id]) {
+        throw new Error(`Thread ${parsedThread.id} has duplicate item id ${item.id}`);
+      }
+      itemsById[item.id] = item;
+      itemIds.push(item.id);
+    }
+
+    itemIdsByTurnId[turn.id] = itemIds;
+  }
+
+  return UnifiedThreadWindowSchema.parse({
+    meta: {
+      id: parsedThread.id,
+      provider: parsedThread.provider,
+      requests: parsedThread.requests,
+      ...(parsedThread.createdAt !== undefined
+        ? { createdAt: parsedThread.createdAt }
+        : {}),
+      ...(parsedThread.updatedAt !== undefined
+        ? { updatedAt: parsedThread.updatedAt }
+        : {}),
+      ...(parsedThread.title !== undefined ? { title: parsedThread.title } : {}),
+      latestCollaborationMode: parsedThread.latestCollaborationMode,
+      latestModel: parsedThread.latestModel,
+      latestReasoningEffort: parsedThread.latestReasoningEffort,
+      ...(parsedThread.latestTokenUsageInfo !== undefined
+        ? { latestTokenUsageInfo: parsedThread.latestTokenUsageInfo }
+        : {}),
+      ...(parsedThread.cwd !== undefined ? { cwd: parsedThread.cwd } : {}),
+      ...(parsedThread.source !== undefined ? { source: parsedThread.source } : {})
+    },
+    range: {
+      totalTurns,
+      totalItems,
+      startTurnIndex,
+      endTurnIndexExclusive,
+      includedTurnCount: selectedTurns.length,
+      includedItemCount,
+      maxItems: parsedOptions.maxItems,
+      hasMoreBefore: startTurnIndex > 0,
+      hasMoreAfter: false
+    },
+    turnOrder,
+    turnsById,
+    itemIdsByTurnId,
+    itemsById
+  });
+}
+
+export function materializeUnifiedThreadWindow(
+  window: UnifiedThreadWindow
+): UnifiedThread {
+  const parsedWindow = UnifiedThreadWindowSchema.parse(window);
+  const turns = parsedWindow.turnOrder.map((turnId) => {
+    const turn = parsedWindow.turnsById[turnId];
+    if (!turn) {
+      throw new Error(`Thread window ${parsedWindow.meta.id} is missing turn ${turnId}`);
+    }
+
+    const itemIds = parsedWindow.itemIdsByTurnId[turnId];
+    if (!itemIds) {
+      throw new Error(
+        `Thread window ${parsedWindow.meta.id} is missing item ids for turn ${turnId}`
+      );
+    }
+
+    const items = itemIds.map((itemId) => {
+      const item = parsedWindow.itemsById[itemId];
+      if (!item) {
+        throw new Error(
+          `Thread window ${parsedWindow.meta.id} is missing item ${itemId}`
+        );
+      }
+      return item;
+    });
+
+    return UnifiedTurnSchema.parse({
+      id: turn.id,
+      ...(turn.turnId !== undefined ? { turnId: turn.turnId } : {}),
+      status: turn.status,
+      ...(turn.turnStartedAtMs !== undefined
+        ? { turnStartedAtMs: turn.turnStartedAtMs }
+        : {}),
+      ...(turn.finalAssistantStartedAtMs !== undefined
+        ? { finalAssistantStartedAtMs: turn.finalAssistantStartedAtMs }
+        : {}),
+      ...(turn.error !== undefined ? { error: turn.error } : {}),
+      ...(turn.diff !== undefined ? { diff: turn.diff } : {}),
+      items
+    });
+  });
+
+  return UnifiedThreadSchema.parse({
+    id: parsedWindow.meta.id,
+    provider: parsedWindow.meta.provider,
+    turns,
+    requests: parsedWindow.meta.requests,
+    ...(parsedWindow.meta.createdAt !== undefined
+      ? { createdAt: parsedWindow.meta.createdAt }
+      : {}),
+    ...(parsedWindow.meta.updatedAt !== undefined
+      ? { updatedAt: parsedWindow.meta.updatedAt }
+      : {}),
+    ...(parsedWindow.meta.title !== undefined ? { title: parsedWindow.meta.title } : {}),
+    latestCollaborationMode: parsedWindow.meta.latestCollaborationMode,
+    latestModel: parsedWindow.meta.latestModel,
+    latestReasoningEffort: parsedWindow.meta.latestReasoningEffort,
+    ...(parsedWindow.meta.latestTokenUsageInfo !== undefined
+      ? { latestTokenUsageInfo: parsedWindow.meta.latestTokenUsageInfo }
+      : {}),
+    ...(parsedWindow.meta.cwd !== undefined ? { cwd: parsedWindow.meta.cwd } : {}),
+    ...(parsedWindow.meta.source !== undefined
+      ? { source: parsedWindow.meta.source }
+      : {})
+  });
+}
+
 export const UnifiedThreadSummarySchema = z
   .object({
     id: NonEmptyStringSchema,
@@ -1012,7 +1262,8 @@ const UnifiedCommandReadThreadSchema = z
     kind: z.literal("readThread"),
     provider: UnifiedProviderIdSchema,
     threadId: NonEmptyStringSchema,
-    includeTurns: z.boolean().optional().default(true)
+    includeTurns: z.boolean().optional().default(true),
+    itemLimit: z.number().int().positive().optional()
   })
   .strict();
 
@@ -1104,7 +1355,8 @@ const UnifiedCommandReadLiveStateSchema = z
   .object({
     kind: z.literal("readLiveState"),
     provider: UnifiedProviderIdSchema,
-    threadId: NonEmptyStringSchema
+    threadId: NonEmptyStringSchema,
+    itemLimit: z.number().int().positive().optional()
   })
   .strict();
 
@@ -1178,7 +1430,8 @@ const UnifiedCommandResultCreateThreadSchema = z
 const UnifiedCommandResultReadThreadSchema = z
   .object({
     kind: z.literal("readThread"),
-    thread: UnifiedThreadSchema
+    thread: UnifiedThreadSchema,
+    threadWindow: z.union([UnifiedThreadWindowSchema, z.null()]).optional()
   })
   .strict();
 
@@ -1229,6 +1482,9 @@ const UnifiedCommandResultReadLiveStateSchema = z
     threadId: NonEmptyStringSchema,
     ownerClientId: z.union([z.string(), z.null()]),
     conversationState: z.union([UnifiedThreadSchema, z.null()]),
+    conversationStateWindow: z
+      .union([UnifiedThreadWindowSchema, z.null()])
+      .optional(),
     liveStateError: z
       .union([
         z
@@ -1374,6 +1630,20 @@ export const UNIFIED_EVENT_KINDS = [
   "error"
 ] as const satisfies ReadonlyArray<UnifiedEventKind>;
 
+export const UNIFIED_REALTIME_CLIENT_FRAME_EVENT = "unified-realtime-client-frame";
+export const UNIFIED_REALTIME_SERVER_FRAME_EVENT = "unified-realtime-server-frame";
+export const UNIFIED_BINARY_HTTP_CONTENT_TYPE =
+  "application/vnd.farfield.unified+protobuf-gzip";
+export const UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP =
+  "protobuf-gzip-v1";
+
+export const UnifiedRealtimeTransportCodecSchema = z.enum([
+  UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP
+]);
+export type UnifiedRealtimeTransportCodec = z.infer<
+  typeof UnifiedRealtimeTransportCodecSchema
+>;
+
 export const UnifiedRealtimeTabSchema = z.enum(["chat", "debug"]);
 export type UnifiedRealtimeTab = z.infer<typeof UnifiedRealtimeTabSchema>;
 
@@ -1501,7 +1771,8 @@ export const UnifiedRealtimeCoreStateSchema = z
     sidebar: z
       .object({
         rows: z.array(UnifiedThreadSummarySchema),
-        errors: UnifiedRealtimeSidebarErrorsSchema
+        errors: UnifiedRealtimeSidebarErrorsSchema,
+        refreshing: z.boolean().optional()
       })
       .strict(),
     rateLimits: z.union([JsonValueSchema, z.null()]),
@@ -1536,11 +1807,11 @@ const UnifiedRealtimeLiveStateErrorSchema = z.union([
 export const UnifiedRealtimeThreadStateSchema = z
   .object({
     threadId: NonEmptyStringSchema,
-    readThread: z.union([UnifiedThreadSchema, z.null()]),
+    readThreadWindow: z.union([UnifiedThreadWindowSchema, z.null()]),
     liveState: z
       .object({
         ownerClientId: z.union([z.string(), z.null()]),
-        conversationState: z.union([UnifiedThreadSchema, z.null()]),
+        conversationStateWindow: z.union([UnifiedThreadWindowSchema, z.null()]),
         liveStateError: UnifiedRealtimeLiveStateErrorSchema
       })
       .strict(),
@@ -1612,7 +1883,8 @@ const UnifiedRealtimeHelloMessageSchema = z
   .object({
     kind: z.literal("hello"),
     selectedThreadId: z.union([z.string(), z.null()]),
-    activeTab: UnifiedRealtimeTabSchema
+    activeTab: UnifiedRealtimeTabSchema,
+    supportedCodecs: z.array(UnifiedRealtimeTransportCodecSchema).optional()
   })
   .strict();
 
@@ -1662,6 +1934,431 @@ export const UNIFIED_REALTIME_CLIENT_MESSAGE_KINDS = [
   "activeTabChanged",
   "requestSnapshot"
 ] as const satisfies ReadonlyArray<UnifiedRealtimeClientMessageKind>;
+
+const UNIFIED_REALTIME_PROTOBUF_VERSION = 1;
+const UNIFIED_REALTIME_PROTOBUF_CODEC_ID_PROTOBUF_GZIP = 1;
+const PROTOBUF_WIRE_TYPE_VARINT = 0;
+const PROTOBUF_WIRE_TYPE_LENGTH_DELIMITED = 2;
+const PROTOBUF_FIELD_VERSION = 1;
+const PROTOBUF_FIELD_CODEC = 2;
+const PROTOBUF_FIELD_PAYLOAD = 3;
+const UNIFIED_BINARY_VALUE_NULL = 0;
+const UNIFIED_BINARY_VALUE_FALSE = 1;
+const UNIFIED_BINARY_VALUE_TRUE = 2;
+const UNIFIED_BINARY_VALUE_NUMBER = 3;
+const UNIFIED_BINARY_VALUE_STRING = 4;
+const UNIFIED_BINARY_VALUE_ARRAY = 5;
+const UNIFIED_BINARY_VALUE_OBJECT = 6;
+
+const UnifiedRealtimeProtobufFrameHeaderSchema = z
+  .object({
+    version: z.literal(UNIFIED_REALTIME_PROTOBUF_VERSION),
+    codec: UnifiedRealtimeTransportCodecSchema,
+    payloadLength: z.number().int().nonnegative()
+  })
+  .strict();
+
+export function selectUnifiedRealtimeTransportCodec(
+  supportedCodecs: readonly UnifiedRealtimeTransportCodec[]
+): UnifiedRealtimeTransportCodec | null {
+  return supportedCodecs.includes(
+    UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP
+  )
+    ? UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP
+    : null;
+}
+
+export function encodeUnifiedRealtimeServerMessageFrame(
+  message: UnifiedRealtimeServerMessage
+): Uint8Array {
+  const parsedMessage = JsonValueSchema.parse(
+    UnifiedRealtimeServerMessageSchema.parse(message)
+  );
+  return encodeUnifiedPayloadFrame(parsedMessage);
+}
+
+export function decodeUnifiedRealtimeServerMessageFrame(
+  frame: Uint8Array | ArrayBuffer
+): UnifiedRealtimeServerMessage {
+  return UnifiedRealtimeServerMessageSchema.parse(
+    decodeUnifiedPayloadFrame(frame)
+  );
+}
+
+export function encodeUnifiedRealtimeClientMessageFrame(
+  message: UnifiedRealtimeClientMessage
+): Uint8Array {
+  const parsedMessage = JsonValueSchema.parse(
+    UnifiedRealtimeClientMessageSchema.parse(message)
+  );
+  return encodeUnifiedPayloadFrame(parsedMessage);
+}
+
+export function decodeUnifiedRealtimeClientMessageFrame(
+  frame: Uint8Array | ArrayBuffer
+): UnifiedRealtimeClientMessage {
+  return UnifiedRealtimeClientMessageSchema.parse(
+    decodeUnifiedPayloadFrame(frame)
+  );
+}
+
+export function encodeUnifiedPayloadFrame(payload: JsonValue): Uint8Array {
+  const parsedPayload = JsonValueSchema.parse(payload);
+  const valuePayload = encodeUnifiedBinaryValue(parsedPayload);
+  const compressedPayload = gzipSync(valuePayload, {
+    level: 1
+  });
+  const headerBytes: number[] = [];
+
+  writeProtobufVarintField(
+    PROTOBUF_FIELD_VERSION,
+    UNIFIED_REALTIME_PROTOBUF_VERSION,
+    headerBytes
+  );
+  writeProtobufVarintField(
+    PROTOBUF_FIELD_CODEC,
+    UNIFIED_REALTIME_PROTOBUF_CODEC_ID_PROTOBUF_GZIP,
+    headerBytes
+  );
+  writeProtobufLengthDelimitedHeader(
+    PROTOBUF_FIELD_PAYLOAD,
+    compressedPayload.length,
+    headerBytes
+  );
+
+  const header = new Uint8Array(headerBytes);
+  const frame = new Uint8Array(header.length + compressedPayload.length);
+  frame.set(header, 0);
+  frame.set(compressedPayload, header.length);
+  return frame;
+}
+
+export function decodeUnifiedPayloadFrame(
+  frame: Uint8Array | ArrayBuffer
+): JsonValue {
+  const decodedFrame = decodeUnifiedRealtimeProtobufFrame(frame);
+  return JsonValueSchema.parse(decodeUnifiedBinaryValue(gunzipSync(decodedFrame.payload)));
+}
+
+function encodeUnifiedBinaryValue(value: JsonValue): Uint8Array {
+  const bytes: number[] = [];
+  writeUnifiedBinaryValue(value, bytes);
+  return new Uint8Array(bytes);
+}
+
+function writeUnifiedBinaryValue(value: JsonValue, bytes: number[]): void {
+  const nullValue = z.null().safeParse(value);
+  if (nullValue.success) {
+    bytes.push(UNIFIED_BINARY_VALUE_NULL);
+    return;
+  }
+
+  const booleanValue = z.boolean().safeParse(value);
+  if (booleanValue.success) {
+    bytes.push(
+      booleanValue.data
+        ? UNIFIED_BINARY_VALUE_TRUE
+        : UNIFIED_BINARY_VALUE_FALSE
+    );
+    return;
+  }
+
+  const numberValue = z.number().safeParse(value);
+  if (numberValue.success) {
+    bytes.push(UNIFIED_BINARY_VALUE_NUMBER);
+    const buffer = new ArrayBuffer(8);
+    new DataView(buffer).setFloat64(0, numberValue.data);
+    bytes.push(...new Uint8Array(buffer));
+    return;
+  }
+
+  const stringValue = z.string().safeParse(value);
+  if (stringValue.success) {
+    bytes.push(UNIFIED_BINARY_VALUE_STRING);
+    writeUnifiedBinaryBytes(strToU8(stringValue.data), bytes);
+    return;
+  }
+
+  const arrayValue = z.array(JsonValueSchema).safeParse(value);
+  if (arrayValue.success) {
+    bytes.push(UNIFIED_BINARY_VALUE_ARRAY);
+    writeProtobufVarint(arrayValue.data.length, bytes);
+    for (const item of arrayValue.data) {
+      writeUnifiedBinaryValue(item, bytes);
+    }
+    return;
+  }
+
+  const objectValue = z.record(JsonValueSchema).safeParse(value);
+  if (objectValue.success) {
+    const entries = Object.entries(objectValue.data);
+    bytes.push(UNIFIED_BINARY_VALUE_OBJECT);
+    writeProtobufVarint(entries.length, bytes);
+    for (const [key, item] of entries) {
+      writeUnifiedBinaryBytes(strToU8(key), bytes);
+      writeUnifiedBinaryValue(item, bytes);
+    }
+    return;
+  }
+
+  JsonValueSchema.parse(value);
+}
+
+function writeUnifiedBinaryBytes(value: Uint8Array, bytes: number[]): void {
+  writeProtobufVarint(value.length, bytes);
+  for (const byte of value) {
+    bytes.push(byte);
+  }
+}
+
+function decodeUnifiedBinaryValue(bytes: Uint8Array): JsonValue {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const result = readUnifiedBinaryValue(view, bytes, 0);
+  if (result.next !== bytes.length) {
+    throw new Error("Unified binary payload has trailing bytes");
+  }
+  return result.value;
+}
+
+function readUnifiedBinaryValue(
+  view: DataView,
+  bytes: Uint8Array,
+  cursor: number
+): { value: JsonValue; next: number } {
+  if (cursor >= bytes.length) {
+    throw new Error("Unexpected end of unified binary value");
+  }
+
+  const tag = bytes[cursor];
+  const valueCursor = cursor + 1;
+
+  if (tag === UNIFIED_BINARY_VALUE_NULL) {
+    return { value: null, next: valueCursor };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_FALSE) {
+    return { value: false, next: valueCursor };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_TRUE) {
+    return { value: true, next: valueCursor };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_NUMBER) {
+    const next = valueCursor + 8;
+    if (next > bytes.length) {
+      throw new Error("Unified binary number exceeds payload size");
+    }
+    return {
+      value: view.getFloat64(valueCursor),
+      next
+    };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_STRING) {
+    const valueResult = readUnifiedBinaryBytes(bytes, valueCursor);
+    return {
+      value: strFromU8(valueResult.value),
+      next: valueResult.next
+    };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_ARRAY) {
+    const lengthResult = readProtobufVarint(view, valueCursor);
+    const value: JsonValue[] = [];
+    let next = lengthResult.next;
+    for (let index = 0; index < lengthResult.value; index += 1) {
+      const itemResult = readUnifiedBinaryValue(view, bytes, next);
+      value.push(itemResult.value);
+      next = itemResult.next;
+    }
+    return { value, next };
+  }
+
+  if (tag === UNIFIED_BINARY_VALUE_OBJECT) {
+    const lengthResult = readProtobufVarint(view, valueCursor);
+    const value: Record<string, JsonValue> = {};
+    let next = lengthResult.next;
+    for (let index = 0; index < lengthResult.value; index += 1) {
+      const keyResult = readUnifiedBinaryBytes(bytes, next);
+      const itemResult = readUnifiedBinaryValue(view, bytes, keyResult.next);
+      value[strFromU8(keyResult.value)] = itemResult.value;
+      next = itemResult.next;
+    }
+    return { value, next };
+  }
+
+  throw new Error(`Unsupported unified binary value tag ${tag}`);
+}
+
+function readUnifiedBinaryBytes(
+  bytes: Uint8Array,
+  cursor: number
+): { value: Uint8Array; next: number } {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const lengthResult = readProtobufVarint(view, cursor);
+  const next = lengthResult.next + lengthResult.value;
+  if (next > bytes.length) {
+    throw new Error("Unified binary bytes exceed payload size");
+  }
+  return {
+    value: bytes.subarray(lengthResult.next, next),
+    next
+  };
+}
+
+function decodeUnifiedRealtimeProtobufFrame(frame: Uint8Array | ArrayBuffer): {
+  payload: Uint8Array;
+} {
+  const bytes = new Uint8Array(frame);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let cursor = 0;
+  let version: number | null = null;
+  let codecId: number | null = null;
+  let payload: Uint8Array | null = null;
+
+  while (cursor < view.byteLength) {
+    const keyResult = readProtobufVarint(view, cursor);
+    cursor = keyResult.next;
+    const fieldNumber = Math.floor(keyResult.value / 8);
+    const wireType = keyResult.value % 8;
+
+    if (fieldNumber === PROTOBUF_FIELD_VERSION) {
+      if (wireType !== PROTOBUF_WIRE_TYPE_VARINT) {
+        throw new Error("Invalid realtime protobuf version wire type");
+      }
+      if (version !== null) {
+        throw new Error("Duplicate realtime protobuf version field");
+      }
+      const valueResult = readProtobufVarint(view, cursor);
+      version = valueResult.value;
+      cursor = valueResult.next;
+      continue;
+    }
+
+    if (fieldNumber === PROTOBUF_FIELD_CODEC) {
+      if (wireType !== PROTOBUF_WIRE_TYPE_VARINT) {
+        throw new Error("Invalid realtime protobuf codec wire type");
+      }
+      if (codecId !== null) {
+        throw new Error("Duplicate realtime protobuf codec field");
+      }
+      const valueResult = readProtobufVarint(view, cursor);
+      codecId = valueResult.value;
+      cursor = valueResult.next;
+      continue;
+    }
+
+    if (fieldNumber === PROTOBUF_FIELD_PAYLOAD) {
+      if (wireType !== PROTOBUF_WIRE_TYPE_LENGTH_DELIMITED) {
+        throw new Error("Invalid realtime protobuf payload wire type");
+      }
+      if (payload !== null) {
+        throw new Error("Duplicate realtime protobuf payload field");
+      }
+      const lengthResult = readProtobufVarint(view, cursor);
+      cursor = lengthResult.next;
+      const nextCursor = cursor + lengthResult.value;
+      if (nextCursor > bytes.length) {
+        throw new Error("Realtime protobuf payload length exceeds frame size");
+      }
+      payload = bytes.subarray(cursor, nextCursor);
+      cursor = nextCursor;
+      continue;
+    }
+
+    throw new Error(
+      `Unsupported realtime protobuf field ${fieldNumber} with wire type ${wireType}`
+    );
+  }
+
+  if (version === null) {
+    throw new Error("Missing realtime protobuf version field");
+  }
+  if (codecId === null) {
+    throw new Error("Missing realtime protobuf codec field");
+  }
+  if (payload === null) {
+    throw new Error("Missing realtime protobuf payload field");
+  }
+
+  UnifiedRealtimeProtobufFrameHeaderSchema.parse({
+    version,
+    codec: decodeUnifiedRealtimeTransportCodec(codecId),
+    payloadLength: payload.length
+  });
+
+  return { payload };
+}
+
+function decodeUnifiedRealtimeTransportCodec(
+  codecId: number
+): UnifiedRealtimeTransportCodec {
+  if (codecId === UNIFIED_REALTIME_PROTOBUF_CODEC_ID_PROTOBUF_GZIP) {
+    return UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP;
+  }
+  throw new Error(`Unsupported realtime protobuf codec id ${codecId}`);
+}
+
+function writeProtobufVarintField(
+  fieldNumber: number,
+  value: number,
+  bytes: number[]
+): void {
+  writeProtobufVarint(
+    fieldNumber * 8 + PROTOBUF_WIRE_TYPE_VARINT,
+    bytes
+  );
+  writeProtobufVarint(value, bytes);
+}
+
+function writeProtobufLengthDelimitedHeader(
+  fieldNumber: number,
+  length: number,
+  bytes: number[]
+): void {
+  writeProtobufVarint(
+    fieldNumber * 8 + PROTOBUF_WIRE_TYPE_LENGTH_DELIMITED,
+    bytes
+  );
+  writeProtobufVarint(length, bytes);
+}
+
+function writeProtobufVarint(value: number, bytes: number[]): void {
+  let remaining = value;
+  while (remaining >= 128) {
+    bytes.push((remaining % 128) + 128);
+    remaining = Math.floor(remaining / 128);
+  }
+  bytes.push(remaining);
+}
+
+function readProtobufVarint(
+  view: DataView,
+  cursor: number
+): { value: number; next: number } {
+  let value = 0;
+  let multiplier = 1;
+  let position = cursor;
+
+  for (let byteCount = 0; byteCount < 10; byteCount += 1) {
+    if (position >= view.byteLength) {
+      throw new Error("Unexpected end of realtime protobuf varint");
+    }
+    const byte = view.getUint8(position);
+    value += (byte % 128) * multiplier;
+    position += 1;
+    if (byte < 128) {
+      return {
+        value,
+        next: position
+      };
+    }
+    multiplier *= 128;
+  }
+
+  throw new Error("Realtime protobuf varint is too long");
+}
 
 type AssertTrue<T extends true> = T;
 type IsNever<T> = [T] extends [never] ? true : false;

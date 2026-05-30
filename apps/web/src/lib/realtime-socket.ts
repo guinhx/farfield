@@ -1,14 +1,15 @@
 import {
+  UNIFIED_REALTIME_CLIENT_FRAME_EVENT,
+  UNIFIED_REALTIME_SERVER_FRAME_EVENT,
   UnifiedRealtimeClientMessageSchema,
-  UnifiedRealtimeServerMessageSchema,
-  type JsonValue,
+  encodeUnifiedRealtimeClientMessageFrame,
+  decodeUnifiedRealtimeServerMessageFrame,
   type UnifiedRealtimeClientMessage,
   type UnifiedRealtimeServerMessage,
 } from "@farfield/unified-surface";
 import { io, type Socket } from "socket.io-client";
 
-const REALTIME_CLIENT_EVENT = "unified-realtime-client-message";
-const REALTIME_SERVER_EVENT = "unified-realtime-server-message";
+type UnifiedRealtimeBinaryPayload = Uint8Array | ArrayBuffer;
 
 export interface UnifiedRealtimeSocket {
   connect(): void;
@@ -35,26 +36,28 @@ export function createUnifiedRealtimeSocket(input: {
       reconnectionDelayMax: 10_000,
     },
   );
+  let connected = false;
 
   socket.on("connect", () => {
+    connected = true;
     input.onConnect?.();
   });
 
   socket.on("disconnect", () => {
+    connected = false;
     input.onDisconnect?.();
   });
 
-  socket.on(REALTIME_SERVER_EVENT, (payload: JsonValue) => {
-    const parsed = UnifiedRealtimeServerMessageSchema.safeParse(payload);
-    if (!parsed.success) {
-      const issues = parsed.error.issues
-        .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
-        .join(" | ");
-      input.onProtocolError?.(`Invalid realtime payload: ${issues}`);
-      return;
-    }
-    input.onMessage(parsed.data);
-  });
+  socket.on(
+    UNIFIED_REALTIME_SERVER_FRAME_EVENT,
+    (payload: UnifiedRealtimeBinaryPayload) => {
+      try {
+        input.onMessage(decodeUnifiedRealtimeServerMessageFrame(payload));
+      } catch (error) {
+        input.onProtocolError?.(`Invalid realtime frame: ${String(error)}`);
+      }
+    },
+  );
 
   return {
     connect(): void {
@@ -64,8 +67,14 @@ export function createUnifiedRealtimeSocket(input: {
       socket.disconnect();
     },
     send(message: UnifiedRealtimeClientMessage): void {
+      if (!connected) {
+        return;
+      }
       const parsed = UnifiedRealtimeClientMessageSchema.parse(message);
-      socket.emit(REALTIME_CLIENT_EVENT, parsed);
+      socket.emit(
+        UNIFIED_REALTIME_CLIENT_FRAME_EVENT,
+        encodeUnifiedRealtimeClientMessageFrame(parsed),
+      );
     },
   };
 }

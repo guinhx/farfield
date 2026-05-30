@@ -1,9 +1,19 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import {
-  UnifiedRealtimeClientMessageSchema,
+  UNIFIED_REALTIME_CLIENT_FRAME_EVENT,
+  UNIFIED_REALTIME_SERVER_FRAME_EVENT,
+  UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP,
+  UNIFIED_BINARY_HTTP_CONTENT_TYPE,
+  JsonValueSchema,
+  buildUnifiedThreadWindow,
   UnifiedRealtimeCoreStateSchema,
   UnifiedRealtimeServerMessageSchema,
+  decodeUnifiedPayloadFrame,
+  decodeUnifiedRealtimeClientMessageFrame,
+  encodeUnifiedPayloadFrame,
+  encodeUnifiedRealtimeServerMessageFrame,
   type UnifiedRealtimeClientMessage,
   type UnifiedRealtimeCoreState,
   type UnifiedRealtimeServerMessage,
@@ -16,8 +26,38 @@ import {
 } from "@farfield/unified-surface";
 import { App } from "../src/App";
 
-type SocketPayload = JsonValue | UnifiedRealtimeServerMessage;
+type SocketPayload = JsonValue | UnifiedRealtimeServerMessage | Uint8Array | ArrayBuffer;
 type SocketListener = (payload?: SocketPayload) => void;
+const TestUnifiedCommandPayloadSchema = z
+  .object({
+    kind: z.string(),
+    provider: z.enum(["codex", "opencode"]),
+    threadId: z.string().optional(),
+    ownerClientId: z.string().optional(),
+    text: z.string().optional(),
+    model: z.string().optional(),
+    requestId: z.union([z.string(), z.number()]).optional(),
+    isSteering: z.boolean().optional(),
+    response: z
+      .object({
+        decision: JsonValueSchema.optional(),
+      })
+      .passthrough()
+      .optional(),
+    collaborationMode: z
+      .object({
+        mode: z.string().optional(),
+        settings: z
+          .object({
+            model: z.string().optional(),
+          })
+          .passthrough()
+          .optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
 
 class MockRealtimeSocket {
   private static instances: MockRealtimeSocket[] = [];
@@ -35,8 +75,22 @@ class MockRealtimeSocket {
 
   public static emitServerMessage(payload: UnifiedRealtimeServerMessage): void {
     const parsed = UnifiedRealtimeServerMessageSchema.parse(payload);
+    const frame = encodeUnifiedRealtimeServerMessageFrame(parsed);
     for (const instance of MockRealtimeSocket.instances) {
-      instance.emitToListeners("unified-realtime-server-message", parsed);
+      instance.emitToListeners(UNIFIED_REALTIME_SERVER_FRAME_EVENT, frame);
+    }
+  }
+
+  public static emitServerFrame(payload: UnifiedRealtimeServerMessage): void {
+    const frame = encodeUnifiedRealtimeServerMessageFrame(payload);
+    for (const instance of MockRealtimeSocket.instances) {
+      instance.emitToListeners(UNIFIED_REALTIME_SERVER_FRAME_EVENT, frame);
+    }
+  }
+
+  public static emitRawServerFrame(payload: Uint8Array): void {
+    for (const instance of MockRealtimeSocket.instances) {
+      instance.emitToListeners(UNIFIED_REALTIME_SERVER_FRAME_EVENT, payload);
     }
   }
 
@@ -51,10 +105,11 @@ class MockRealtimeSocket {
     return this;
   }
 
-  public emit(_event: string, _payload?: JsonValue): boolean {
-    if (_event === "unified-realtime-client-message") {
-      const parsed = UnifiedRealtimeClientMessageSchema.parse(_payload);
-      MockRealtimeSocket.clientMessages.push(parsed);
+  public emit(_event: string, _payload?: Uint8Array | ArrayBuffer): boolean {
+    if (_event === UNIFIED_REALTIME_CLIENT_FRAME_EVENT) {
+      MockRealtimeSocket.clientMessages.push(
+        decodeUnifiedRealtimeClientMessageFrame(_payload ?? new Uint8Array()),
+      );
     }
     return true;
   }
@@ -451,6 +506,7 @@ function buildRealtimeFeatureSet(): Record<string, { status: "available" }> {
 
 function buildRealtimeCoreStateFixture(
   rows: UnifiedRealtimeCoreState["sidebar"]["rows"],
+  options?: { refreshing?: boolean },
 ): UnifiedRealtimeCoreState {
   return UnifiedRealtimeCoreStateSchema.parse({
     health: {
@@ -490,6 +546,7 @@ function buildRealtimeCoreStateFixture(
         codex: null,
         opencode: null,
       },
+      ...(options?.refreshing ? { refreshing: true } : {}),
     },
     rateLimits: null,
     traceStatus: null,
@@ -501,12 +558,13 @@ function buildRealtimeThreadStateFixture(
   threadId: string,
   modelId: string,
 ): UnifiedRealtimeThreadState {
+  const thread = buildConversationStateFixture(threadId, modelId);
   return {
     threadId,
-    readThread: buildConversationStateFixture(threadId, modelId),
+    readThreadWindow: buildUnifiedThreadWindow(thread, { maxItems: 170 }),
     liveState: {
       ownerClientId: "client-1",
-      conversationState: buildConversationStateFixture(threadId, modelId),
+      conversationStateWindow: null,
       liveStateError: null,
     },
     streamEvents: [],
@@ -519,10 +577,15 @@ function jsonResponse(
     object | string | number | boolean | null | undefined
   >,
 ): Response {
-  return {
-    ok: true,
-    json: async () => payload,
-  } as Response;
+  const frame = encodeUnifiedPayloadFrame(JsonValueSchema.parse(payload));
+  const body = new ArrayBuffer(frame.byteLength);
+  new Uint8Array(body).set(frame);
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "Content-Type": UNIFIED_BINARY_HTTP_CONTENT_TYPE,
+    },
+  });
 }
 
 function jsonErrorResponse(
@@ -531,14 +594,44 @@ function jsonErrorResponse(
     object | string | number | boolean | null | undefined
   >,
 ): Response {
-  return {
-    ok: false,
-    json: async () => payload,
-  } as Response;
+  const frame = encodeUnifiedPayloadFrame(JsonValueSchema.parse(payload));
+  const body = new ArrayBuffer(frame.byteLength);
+  new Uint8Array(body).set(frame);
+  return new Response(body, {
+    status: 500,
+    headers: {
+      "Content-Type": UNIFIED_BINARY_HTTP_CONTENT_TYPE,
+    },
+  });
+}
+
+async function readRequestPayload(
+  init: RequestInit | undefined,
+): Promise<JsonValue> {
+  const body = await new Response(
+    init?.body ?? new ArrayBuffer(0),
+  ).arrayBuffer();
+  if (body.byteLength === 0) {
+    return JsonValueSchema.parse({});
+  }
+  return decodeUnifiedPayloadFrame(body);
+}
+
+async function readCommandPayload(
+  init: RequestInit | undefined,
+): Promise<z.infer<typeof TestUnifiedCommandPayloadSchema>> {
+  return TestUnifiedCommandPayloadSchema.parse(await readRequestPayload(init));
+}
+
+function countFetchCalls(pathname: string): number {
+  return vi.mocked(fetch).mock.calls.filter(([input]) => {
+    return new URL(String(input), "http://localhost").pathname === pathname;
+  }).length;
 }
 
 beforeEach(() => {
   MockRealtimeSocket.reset();
+  vi.mocked(fetch).mockClear();
   window.history.replaceState(null, "", "/");
   localStorageBacking.clear();
 
@@ -673,7 +766,10 @@ vi.stubGlobal(
           : null;
       const readThread = readThreadResolver(threadId, provider);
       if (readThread) {
-        return jsonResponse(readThread);
+        return jsonResponse({
+          ...readThread,
+          shape: "thread",
+        });
       }
       return jsonErrorResponse({
         ok: false,
@@ -685,13 +781,7 @@ vi.stubGlobal(
     }
 
     if (pathname === "/api/unified/command") {
-      const body = init?.body
-        ? (JSON.parse(String(init.body)) as {
-            kind: string;
-            provider: ProviderId;
-            threadId?: string;
-          })
-        : { kind: "unknown", provider: "codex" as const };
+      const body = await readCommandPayload(init);
 
       if (body.kind === "listProjectDirectories") {
         return jsonResponse({
@@ -776,6 +866,17 @@ describe("App", () => {
     expect(await screen.findByText("No thread selected")).toBeTruthy();
   });
 
+  it("does not duplicate the initial core load", async () => {
+    render(<App />);
+    expect(await screen.findByText("No thread selected")).toBeTruthy();
+
+    await waitFor(() => {
+      expect(countFetchCalls("/api/unified/sidebar")).toBe(1);
+    });
+    expect(countFetchCalls("/api/health")).toBe(1);
+    expect(countFetchCalls("/api/account/rate-limits")).toBe(0);
+  });
+
   it("shows a provider connection state when sidebar listing is disconnected", async () => {
     featureMatrixFixture = {
       ok: true,
@@ -822,6 +923,13 @@ describe("App", () => {
           (message) => message.kind === "hello",
         ),
       ).toBe(true);
+    });
+    const helloMessage = MockRealtimeSocket.getClientMessages().find(
+      (message) => message.kind === "hello",
+    );
+    expect(helloMessage).toMatchObject({
+      kind: "hello",
+      supportedCodecs: [UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP],
     });
   });
 
@@ -881,6 +989,54 @@ describe("App", () => {
     expect((await screen.findAllByText("Snapshot thread preview")).length).toBeGreaterThan(0);
   });
 
+  it("applies websocket binary frame state", async () => {
+    const threadId = "ws-frame-thread";
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "Before frame preview",
+          title: null,
+          createdAt: 1700000000,
+          updatedAt: 1700000000,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+    render(<App />);
+    expect((await screen.findAllByText("Before frame preview")).length).toBeGreaterThan(0);
+
+    MockRealtimeSocket.emitServerFrame({
+      kind: "coreDelta",
+      syncVersion: 2,
+      core: buildRealtimeCoreStateFixture([
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "Frame delta preview",
+          title: null,
+          createdAt: 1700000000,
+          updatedAt: 1700000002,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ]),
+    });
+
+    expect((await screen.findAllByText("Frame delta preview")).length).toBeGreaterThan(0);
+  });
+
   it("applies websocket core deltas", async () => {
     const threadId = "ws-core-thread";
     threadsFixture = {
@@ -934,6 +1090,109 @@ describe("App", () => {
     });
 
     expect((await screen.findAllByText("Core delta preview")).length).toBeGreaterThan(0);
+  });
+
+  it("keeps the sidebar skeleton while realtime sidebar data is refreshing", async () => {
+    render(<App />);
+    expect(await screen.findByText("No thread selected")).toBeTruthy();
+
+    MockRealtimeSocket.emitServerMessage({
+      kind: "coreDelta",
+      syncVersion: 2,
+      core: buildRealtimeCoreStateFixture([], { refreshing: true }),
+    });
+
+    expect(await screen.findByTestId("sidebar-loading-skeleton")).toBeTruthy();
+    expect(screen.queryByText("No threads")).toBeNull();
+  });
+
+  it("ignores stale websocket messages by sync version", async () => {
+    const threadId = "ws-stale-thread";
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "Before stale delta preview",
+          title: null,
+          createdAt: 1700000000,
+          updatedAt: 1700000000,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+    render(<App />);
+    expect(
+      (await screen.findAllByText("Before stale delta preview")).length,
+    ).toBeGreaterThan(0);
+
+    MockRealtimeSocket.emitServerMessage({
+      kind: "coreDelta",
+      syncVersion: 4,
+      core: buildRealtimeCoreStateFixture([
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "Fresh delta preview",
+          title: null,
+          createdAt: 1700000000,
+          updatedAt: 1700000004,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ]),
+    });
+    MockRealtimeSocket.emitServerMessage({
+      kind: "coreDelta",
+      syncVersion: 3,
+      core: buildRealtimeCoreStateFixture([
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "Stale delta preview",
+          title: null,
+          createdAt: 1700000000,
+          updatedAt: 1700000003,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ]),
+    });
+
+    expect((await screen.findAllByText("Fresh delta preview")).length)
+      .toBeGreaterThan(0);
+    expect(screen.queryByText("Stale delta preview")).toBeNull();
+  });
+
+  it("requests a fresh snapshot after an invalid websocket frame", async () => {
+    render(<App />);
+    await waitFor(() => {
+      expect(
+        MockRealtimeSocket.getClientMessages().some(
+          (message) => message.kind === "hello",
+        ),
+      ).toBe(true);
+    });
+
+    MockRealtimeSocket.emitRawServerFrame(new Uint8Array([8]));
+
+    await waitFor(() => {
+      expect(
+        MockRealtimeSocket.getClientMessages().some(
+          (message) => message.kind === "requestSnapshot",
+        ),
+      ).toBe(true);
+    });
   });
 
   it("applies websocket debug deltas while debug tab is active", async () => {
@@ -1255,7 +1514,7 @@ describe("App", () => {
     expect(screen.queryByText("listed-thread-loaded")).toBeNull();
   });
 
-  it("clears a transient direct-route registration error after the thread loads", async () => {
+  it("loads a direct-route thread after a transient registration miss", async () => {
     const threadId = "thread-direct-route-transient";
     window.history.replaceState(null, "", `/threads/${threadId}`);
 
@@ -1301,9 +1560,6 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(
-      await screen.findByText(`Thread ${threadId} is not registered`),
-    ).toBeTruthy();
     expect(
       (
         await screen.findAllByText(
@@ -1514,27 +1770,15 @@ describe("App", () => {
     await waitFor(() => expect(sendButton.getAttribute("disabled")).toBeNull());
     fireEvent.click(sendButton);
 
-    type UnifiedCommandPayload = {
-      kind?: string;
-      ownerClientId?: string;
-      text?: string;
-      collaborationMode?: {
-        mode?: string;
-        settings?: {
-          model?: string;
-        };
-      };
-    };
-
-    await waitFor(() => {
-      const payloads = vi
-        .mocked(fetch)
-        .mock
-        .calls
-        .filter(([input]) => String(input).includes("/api/unified/command"))
-        .map(([, init]) =>
-          JSON.parse(String(init?.body ?? "{}")) as UnifiedCommandPayload,
-        );
+    await waitFor(async () => {
+      const payloads = await Promise.all(
+        vi
+          .mocked(fetch)
+          .mock
+          .calls
+          .filter(([input]) => String(input).includes("/api/unified/command"))
+          .map(([, init]) => readCommandPayload(init)),
+      );
 
       const sendCommand =
         payloads.find(
@@ -1665,26 +1909,15 @@ describe("App", () => {
     await waitFor(() => expect(sendButton.getAttribute("disabled")).toBeNull());
     fireEvent.click(sendButton);
 
-    type UnifiedCommandPayload = {
-      kind?: string;
-      text?: string;
-      model?: string;
-      collaborationMode?: {
-        settings?: {
-          model?: string;
-        };
-      };
-    };
-
-    await waitFor(() => {
-      const payloads = vi
-        .mocked(fetch)
-        .mock
-        .calls
-        .filter(([input]) => String(input).includes("/api/unified/command"))
-        .map(([, init]) =>
-          JSON.parse(String(init?.body ?? "{}")) as UnifiedCommandPayload,
-        );
+    await waitFor(async () => {
+      const payloads = await Promise.all(
+        vi
+          .mocked(fetch)
+          .mock
+          .calls
+          .filter(([input]) => String(input).includes("/api/unified/command"))
+          .map(([, init]) => readCommandPayload(init)),
+      );
 
       const sendCommand =
         payloads.find(
@@ -1697,6 +1930,234 @@ describe("App", () => {
       expect(sendCommand?.model).toBe(latestModelId);
       expect(sendCommand?.collaborationMode?.settings?.model).toBe(
         latestModelId,
+      );
+    });
+  });
+
+  it("enables Codex composer and mode controls without a visible owner id", async () => {
+    const threadId = "thread-no-visible-owner";
+    const modelId = "gpt-5.3-codex";
+    const threadState = buildConversationStateFixture(threadId, modelId);
+
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "thread preview",
+          createdAt: 1700000000,
+          updatedAt: 1700000000,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+
+    readThreadResolver = (targetThreadId: string) => ({
+      ok: true,
+      thread: {
+        ...threadState,
+        id: targetThreadId,
+      },
+    });
+
+    liveStateResolver = (targetThreadId: string, _provider: ProviderId) => ({
+      kind: "readLiveState",
+      threadId: targetThreadId,
+      ownerClientId: null,
+      conversationState: {
+        ...threadState,
+        id: targetThreadId,
+      },
+      liveStateError: null,
+    });
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByRole("textbox"), {
+      target: { value: "Send without owner id" },
+    });
+
+    const sendButton = await screen.findByRole("button", { name: "Send" });
+    await waitFor(() => expect(sendButton.getAttribute("disabled")).toBeNull());
+
+    const planButton = await screen.findByRole("button", { name: "Plan" });
+    await waitFor(() => expect(planButton.getAttribute("disabled")).toBeNull());
+
+    await waitFor(() => {
+      const pickers = screen.getAllByRole("combobox");
+      expect(pickers.length).toBeGreaterThanOrEqual(2);
+      expect(pickers.every((picker) => picker.getAttribute("disabled") === null))
+        .toBe(true);
+    });
+  });
+
+  it("sends mobile composer text as steering while a Codex turn is running", async () => {
+    const threadId = "thread-running-steer";
+    const modelId = "gpt-5.3-codex";
+    const baseThreadState = buildConversationStateFixture(threadId, modelId);
+    const runningThreadState: UnifiedThreadFixture = {
+      ...baseThreadState,
+      turns: [
+        {
+          id: "turn-1",
+          status: "inProgress",
+          items: [
+            {
+              id: "assistant-working",
+              type: "agentMessage",
+              text: "Working on it",
+            },
+          ],
+        },
+      ],
+    };
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "running thread",
+          isGenerating: true,
+          createdAt: 1700000000,
+          updatedAt: 1700000000,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+
+    readThreadResolver = (targetThreadId: string) => ({
+      ok: true,
+      thread: {
+        ...runningThreadState,
+        id: targetThreadId,
+      },
+    });
+
+    liveStateResolver = (targetThreadId: string, _provider: ProviderId) => ({
+      kind: "readLiveState",
+      threadId: targetThreadId,
+      ownerClientId: "client-1",
+      conversationState: {
+        ...runningThreadState,
+        id: targetThreadId,
+      },
+      liveStateError: null,
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("Working on it")).toBeTruthy();
+    const stopButton = await screen.findByRole("button", { name: "Stop" });
+    await waitFor(() => expect(stopButton.getAttribute("disabled")).toBeNull());
+
+    fireEvent.change(await screen.findByRole("textbox"), {
+      target: { value: "Prioritize the parser fix" },
+    });
+
+    const steerButton = await screen.findByRole("button", { name: "Steer" });
+    await waitFor(() =>
+      expect(steerButton.getAttribute("disabled")).toBeNull(),
+    );
+    fireEvent.click(steerButton);
+
+    await waitFor(async () => {
+      const commandBodies = await Promise.all(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(([_input, init]) => Boolean(init?.body))
+          .map(([_input, init]) => readCommandPayload(init)),
+      );
+      expect(commandBodies).toContainEqual(
+        expect.objectContaining({
+          kind: "sendMessage",
+          provider: "codex",
+          threadId,
+          text: "Prioritize the parser fix",
+          ownerClientId: "client-1",
+          isSteering: true,
+        }),
+      );
+    });
+  });
+
+  it("enables Codex composer while selected thread state is still loading", async () => {
+    const threadId = "thread-state-loading";
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "thread preview",
+          createdAt: 1700000000,
+          updatedAt: 1700000000,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+
+    liveStateResolver = (targetThreadId: string, _provider: ProviderId) => ({
+      kind: "readLiveState",
+      threadId: targetThreadId,
+      ownerClientId: null,
+      conversationState: null,
+      liveStateError: null,
+    });
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByRole("textbox"), {
+      target: { value: "Send before full thread state is loaded" },
+    });
+
+    const sendButton = await screen.findByRole("button", { name: "Send" });
+    await waitFor(() => expect(sendButton.getAttribute("disabled")).toBeNull());
+
+    fireEvent.click(sendButton);
+
+    await waitFor(async () => {
+      const commandBodies = await Promise.all(
+        vi
+          .mocked(fetch)
+          .mock.calls.filter(([_input, init]) => Boolean(init?.body))
+          .map(([_input, init]) => readCommandPayload(init)),
+      );
+      expect(commandBodies).toContainEqual(
+        expect.objectContaining({
+          kind: "sendMessage",
+          provider: "codex",
+          threadId,
+          text: "Send before full thread state is loaded",
+        }),
       );
     });
   });
@@ -2227,24 +2688,15 @@ describe("App", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
 
-    type UnifiedCommandPayload = {
-      kind?: string;
-      ownerClientId?: string;
-      requestId?: string | number;
-      response?: {
-        decision?: JsonValue;
-      };
-    };
-
-    await waitFor(() => {
-      const payloads = vi
-        .mocked(fetch)
-        .mock
-        .calls
-        .filter(([input]) => String(input).includes("/api/unified/command"))
-        .map(([, init]) =>
-          JSON.parse(String(init?.body ?? "{}")) as UnifiedCommandPayload,
-        );
+    await waitFor(async () => {
+      const payloads = await Promise.all(
+        vi
+          .mocked(fetch)
+          .mock
+          .calls
+          .filter(([input]) => String(input).includes("/api/unified/command"))
+          .map(([, init]) => readCommandPayload(init)),
+      );
 
       const submitCommand =
         payloads.find(
@@ -2326,24 +2778,15 @@ describe("App", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
 
-    type UnifiedCommandPayload = {
-      kind?: string;
-      ownerClientId?: string;
-      requestId?: string | number;
-      response?: {
-        decision?: JsonValue;
-      };
-    };
-
-    await waitFor(() => {
-      const payloads = vi
-        .mocked(fetch)
-        .mock
-        .calls
-        .filter(([input]) => String(input).includes("/api/unified/command"))
-        .map(([, init]) =>
-          JSON.parse(String(init?.body ?? "{}")) as UnifiedCommandPayload,
-        );
+    await waitFor(async () => {
+      const payloads = await Promise.all(
+        vi
+          .mocked(fetch)
+          .mock
+          .calls
+          .filter(([input]) => String(input).includes("/api/unified/command"))
+          .map(([, init]) => readCommandPayload(init)),
+      );
 
       const submitCommand =
         payloads.find(

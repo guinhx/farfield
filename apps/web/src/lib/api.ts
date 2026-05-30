@@ -9,10 +9,15 @@ import {
   UnifiedFeatureMatrixSchema,
   UnifiedModelSchema,
   UnifiedProviderIdSchema,
+  UnifiedThreadWindowSchema,
   UnifiedThreadSchema,
   UnifiedThreadSummarySchema,
   UnifiedThreadRequestResponseSchema,
   UnifiedUserInputRequestIdSchema,
+  UNIFIED_BINARY_HTTP_CONTENT_TYPE,
+  decodeUnifiedPayloadFrame,
+  encodeUnifiedPayloadFrame,
+  materializeUnifiedThreadWindow,
   type JsonValue,
   type UnifiedApprovalThreadRequest,
   type UnifiedCommand,
@@ -190,12 +195,22 @@ const UnifiedThreadsEnvelopeSchema = z
   })
   .strict();
 
-const UnifiedReadThreadEnvelopeSchema = z
-  .object({
-    ok: z.literal(true),
-    thread: UnifiedThreadSchema,
-  })
-  .strict();
+const UnifiedReadThreadEnvelopeSchema = z.discriminatedUnion("shape", [
+  z
+    .object({
+      ok: z.literal(true),
+      shape: z.literal("thread"),
+      thread: UnifiedThreadSchema,
+    })
+    .strict(),
+  z
+    .object({
+      ok: z.literal(true),
+      shape: z.literal("threadWindow"),
+      threadWindow: UnifiedThreadWindowSchema,
+    })
+    .strict(),
+]);
 
 const UnifiedFeaturesEnvelopeSchema = z
   .object({
@@ -210,6 +225,9 @@ const LiveStateResponseSchema = z
     threadId: z.string(),
     ownerClientId: z.string().nullable(),
     conversationState: z.union([UnifiedThreadSchema, z.null()]),
+    conversationStateWindow: z
+      .union([UnifiedThreadWindowSchema, z.null()])
+      .optional(),
     liveStateError: z
       .union([
         z
@@ -364,6 +382,7 @@ const SidebarThreadsEnvelopeSchema = z
         opencode: z.union([UnifiedProviderErrorSchema, z.null()]),
       })
       .strict(),
+    refreshing: z.boolean().optional(),
   })
   .strict();
 
@@ -376,12 +395,14 @@ const SidebarThreadsResponseSchema = z
         opencode: z.union([UnifiedProviderErrorSchema, z.null()]),
       })
       .strict(),
+    refreshing: z.boolean().optional(),
   })
   .strict();
 
 const ReadThreadResponseSchema = z
   .object({
     thread: UnifiedThreadSchema,
+    window: z.union([UnifiedThreadWindowSchema, z.null()]),
   })
   .strict();
 
@@ -469,12 +490,31 @@ export function getUnifiedWebSocketUrl(baseUrlOverride?: string): string {
   return buildServerWebSocketUrl("/api/unified/ws", baseUrlOverride);
 }
 
-async function requestJson(
+function encodeRequestBody(payload: JsonValue): ArrayBuffer {
+  const frame = encodeUnifiedPayloadFrame(payload);
+  const body = new ArrayBuffer(frame.byteLength);
+  new Uint8Array(body).set(frame);
+  return body;
+}
+
+async function requestBinary(
   path: string,
   init?: RequestInit,
 ): Promise<{ response: Response; payload: JsonValue }> {
-  const response = await fetch(buildServerUrl(path), init);
-  const payload = JsonValueSchema.parse(await response.json());
+  const headers = new Headers(init?.headers);
+  headers.set("Accept", UNIFIED_BINARY_HTTP_CONTENT_TYPE);
+  if (init?.body) {
+    headers.set("Content-Type", UNIFIED_BINARY_HTTP_CONTENT_TYPE);
+  }
+  const response = await fetch(buildServerUrl(path), {
+    ...init,
+    headers,
+  });
+  const contentType = response.headers.get("content-type") ?? "";
+  if (contentType.split(";")[0]?.trim() !== UNIFIED_BINARY_HTTP_CONTENT_TYPE) {
+    throw new Error(`Unexpected API content type: ${contentType || "(empty)"}`);
+  }
+  const payload = decodeUnifiedPayloadFrame(await response.arrayBuffer());
   return {
     response,
     payload,
@@ -528,7 +568,7 @@ async function requestEnvelope<T>(
   schema: z.ZodType<T>,
   init?: RequestInit,
 ): Promise<T> {
-  const { response, payload } = await requestJson(path, init);
+  const { response, payload } = await requestBinary(path, init);
 
   if (!response.ok) {
     throw buildApiRequestError(payload);
@@ -546,12 +586,9 @@ async function runUnifiedCommand(
   command: UnifiedCommand,
 ): Promise<UnifiedCommandResult> {
   const parsedCommand = UnifiedCommandSchema.parse(command);
-  const { response, payload } = await requestJson("/api/unified/command", {
+  const { response, payload } = await requestBinary("/api/unified/command", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(parsedCommand),
+    body: encodeRequestBody(JsonValueSchema.parse(parsedCommand)),
   });
 
   if (!response.ok) {
@@ -739,12 +776,13 @@ export async function listSidebarThreads(options: {
   return SidebarThreadsResponseSchema.parse({
     rows: payload.rows,
     errors: payload.errors,
+    refreshing: payload.refreshing ?? false,
   });
 }
 
 export async function readThread(
   threadId: string,
-  options?: { includeTurns?: boolean; provider?: AgentId },
+  options?: { includeTurns?: boolean; provider?: AgentId; itemLimit?: number },
 ): Promise<z.infer<typeof ReadThreadResponseSchema>> {
   const params = new URLSearchParams();
   if (typeof options?.provider === "string") {
@@ -753,15 +791,26 @@ export async function readThread(
   if (typeof options?.includeTurns === "boolean") {
     params.set("includeTurns", options.includeTurns ? "1" : "0");
   }
+  if (options?.itemLimit) {
+    params.set("itemLimit", String(options.itemLimit));
+  }
 
   const query = params.toString();
   const payload = await requestEnvelope(
     `/api/unified/thread/${encodeURIComponent(threadId)}${query.length > 0 ? `?${query}` : ""}`,
     UnifiedReadThreadEnvelopeSchema,
   );
+  if (payload.shape === "threadWindow") {
+    const threadWindow = UnifiedThreadWindowSchema.parse(payload.threadWindow);
+    return ReadThreadResponseSchema.parse({
+      thread: materializeUnifiedThreadWindow(threadWindow),
+      window: threadWindow,
+    });
+  }
 
   return ReadThreadResponseSchema.parse({
     thread: payload.thread,
+    window: null,
   });
 }
 
@@ -838,22 +887,34 @@ export async function listModels(
 export async function getLiveState(
   threadId: string,
   provider: AgentId,
+  options?: { itemLimit?: number },
 ): Promise<z.infer<typeof LiveStateResponseSchema>> {
   const result = await runUnifiedCommand({
     kind: "readLiveState",
     provider,
     threadId,
+    ...(options?.itemLimit ? { itemLimit: options.itemLimit } : {}),
   });
 
   if (result.kind !== "readLiveState") {
     throw new Error(`Unexpected unified command result: ${result.kind}`);
   }
 
+  const conversationStateWindow = result.conversationStateWindow
+    ? UnifiedThreadWindowSchema.parse(result.conversationStateWindow)
+    : null;
+  const conversationState =
+    result.conversationState ??
+    (conversationStateWindow
+      ? materializeUnifiedThreadWindow(conversationStateWindow)
+      : null);
+
   return LiveStateResponseSchema.parse({
     ok: true,
     threadId: result.threadId,
     ownerClientId: result.ownerClientId,
-    conversationState: result.conversationState,
+    conversationState,
+    conversationStateWindow,
     liveStateError: result.liveStateError ?? null,
   });
 }
@@ -1040,8 +1101,7 @@ export async function startTrace(label: string): Promise<void> {
     z.object({ ok: z.literal(true) }).passthrough(),
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ label }),
+      body: encodeRequestBody(JsonValueSchema.parse({ label })),
     },
   );
 }
@@ -1052,8 +1112,7 @@ export async function markTrace(note: string): Promise<void> {
     z.object({ ok: z.literal(true) }).passthrough(),
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ note }),
+      body: encodeRequestBody(JsonValueSchema.parse({ note })),
     },
   );
 }
@@ -1064,8 +1123,7 @@ export async function stopTrace(): Promise<void> {
     z.object({ ok: z.literal(true) }).passthrough(),
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
+      body: encodeRequestBody(JsonValueSchema.parse({})),
     },
   );
 }

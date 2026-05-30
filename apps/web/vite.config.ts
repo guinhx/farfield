@@ -102,7 +102,10 @@ export default defineConfig(({ command }) => {
       allowedHosts: true,
       port: 4312,
       proxy: {
-        "/api": apiOrigin,
+        "/api": {
+          target: apiOrigin,
+          ws: true,
+        },
         "/events": apiOrigin,
       },
     },
@@ -110,7 +113,10 @@ export default defineConfig(({ command }) => {
       host: "127.0.0.1",
       port: 4312,
       proxy: {
-        "/api": apiOrigin,
+        "/api": {
+          target: apiOrigin,
+          ws: true,
+        },
         "/events": apiOrigin,
       },
     },

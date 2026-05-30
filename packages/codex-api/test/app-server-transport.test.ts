@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   ChildProcessAppServerTransport,
   type AppServerRequestId,
+  shouldUseShellForAppServerTransport,
 } from "../src/app-server-transport.js";
 
 const tempDirectories: string[] = [];
@@ -187,6 +188,24 @@ afterEach(() => {
 });
 
 describe("ChildProcessAppServerTransport", () => {
+  it("runs Windows exe app-server binaries without a shell", () => {
+    expect(
+      shouldUseShellForAppServerTransport(
+        "C:\\Users\\Dinho\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe",
+        "win32",
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps shell execution for Windows command shims", () => {
+    expect(
+      shouldUseShellForAppServerTransport(
+        "C:\\Users\\Dinho\\AppData\\Roaming\\npm\\codex.cmd",
+        "win32",
+      ),
+    ).toBe(true);
+  });
+
   it(
     "sends initialize then initialized and handles server notifications and requests",
     async () => {

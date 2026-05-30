@@ -9,6 +9,7 @@ import {
 } from "react";
 import {
   Activity,
+  ArrowUp,
   Bug,
   Circle,
   CircleDot,
@@ -75,6 +76,8 @@ import {
   writeSidebarOrder,
 } from "@/lib/sidebar-prefs";
 import {
+  UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP,
+  materializeUnifiedThreadWindow,
   type UnifiedRealtimeCoreState,
   type UnifiedRealtimeServerMessage,
   type UnifiedRealtimeThreadState,
@@ -129,6 +132,7 @@ type TraceStatus = Awaited<ReturnType<typeof getTraceStatus>>;
 type HistoryResponse = Awaited<ReturnType<typeof listDebugHistory>>;
 type HistoryDetail = Awaited<ReturnType<typeof getHistoryEntry>>;
 type CreatedThread = Awaited<ReturnType<typeof createThread>>["thread"];
+type PendingRealtimeMessage = UnifiedRealtimeServerMessage;
 type PendingRequest = ReturnType<typeof getPendingUserInputRequests>[number];
 type PendingApprovalRequest = ReturnType<typeof getPendingApprovalRequests>[number];
 type PendingThreadRequest = ReturnType<typeof getPendingThreadRequests>[number];
@@ -136,11 +140,24 @@ type PendingRequestId = PendingRequest["id"];
 type Thread = SidebarThreadsResponse["rows"][number];
 type ThreadListProviderErrors = SidebarThreadsResponse["errors"];
 type AgentDescriptor = AgentsResponse["agents"][number];
+type SteeringPromptQueueStatus = "pending" | "sending" | "failed";
+type SteeringPromptQueueItem = {
+  id: string;
+  threadId: string;
+  provider: AgentId;
+  ownerClientId: string | null;
+  text: string;
+  status: SteeringPromptQueueStatus;
+  createdAtMs: number;
+  errorMessage?: string;
+};
 type ConversationTurn = NonNullable<
   ReadThreadResponse["thread"]
 >["turns"][number];
 type ConversationTurnItem = NonNullable<ConversationTurn["items"]>[number];
 type FlatConversationItem = ChatTimelineEntry;
+
+const DEBUG_STREAM_EVENT_RENDER_LIMIT = 250;
 
 function formatTimingSummary(
   metric:
@@ -206,6 +223,7 @@ interface NormalizedTokenUsage {
 interface LoadSelectedThreadOptions {
   includeTurns: boolean;
   includeStreamEvents: boolean;
+  itemLimit: number;
 }
 
 interface CachedThreadViewState {
@@ -280,6 +298,36 @@ interface MobileSidebarSwipeGesture {
   mode: "open" | "close";
   startX: number;
   startY: number;
+}
+
+function SidebarThreadSkeletonList(): React.JSX.Element {
+  return (
+    <div
+      data-testid="sidebar-loading-skeleton"
+      className="space-y-2 px-2 py-1 animate-pulse"
+    >
+      {["a", "b", "c", "d", "e", "f"].map((key, index) => (
+        <div
+          key={key}
+          className="rounded-lg border border-sidebar-border/60 bg-sidebar-accent/20 px-3 py-3"
+        >
+          <div className="flex items-center gap-2">
+            <div className="h-4 w-4 rounded bg-sidebar-accent" />
+            <div className="h-3.5 w-24 rounded bg-sidebar-accent" />
+            <div className="ml-auto h-3 w-8 rounded bg-sidebar-accent/80" />
+          </div>
+          <div className="mt-2 space-y-1.5">
+            <div className="h-3 w-full rounded bg-sidebar-accent/80" />
+            <div
+              className={`h-3 rounded bg-sidebar-accent/70 ${
+                index % 2 === 0 ? "w-4/5" : "w-2/3"
+              }`}
+            />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 /* ── Helpers ────────────────────────────────────────────────── */
@@ -681,6 +729,78 @@ function hasSameThreadListErrors(
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function haveSameStreamEvents(
+  left: StreamEventsResponse["events"],
+  right: StreamEventsResponse["events"],
+): boolean {
+  if (left === right) {
+    return true;
+  }
+  if (left.length !== right.length) {
+    return false;
+  }
+  if (left.length === 0) {
+    return true;
+  }
+  const lastIndex = left.length - 1;
+  return JSON.stringify(left[lastIndex]) === JSON.stringify(right[lastIndex]);
+}
+
+function appendRealtimeMessage(
+  current: UnifiedRealtimeServerMessage[],
+  next: UnifiedRealtimeServerMessage,
+  latestAppliedSyncVersion: number,
+): UnifiedRealtimeServerMessage[] {
+  if (next.syncVersion <= latestAppliedSyncVersion) {
+    return current;
+  }
+
+  switch (next.kind) {
+    case "snapshot":
+      return [
+        ...current.filter(
+          (item) =>
+            item.kind === "syncError" || item.syncVersion > next.syncVersion,
+        ),
+        next,
+      ];
+    case "coreDelta":
+      return [
+        ...current.filter(
+          (item) =>
+            item.kind !== "coreDelta" || item.syncVersion > next.syncVersion,
+        ),
+        next,
+      ];
+    case "threadDelta":
+      return [
+        ...current.filter(
+          (item) =>
+            item.kind !== "threadDelta" ||
+            item.thread.threadId !== next.thread.threadId ||
+            item.syncVersion > next.syncVersion,
+        ),
+        next,
+      ];
+    case "debugDelta":
+      return [
+        ...current.filter(
+          (item) =>
+            item.kind !== "debugDelta" || item.syncVersion > next.syncVersion,
+        ),
+        next,
+      ];
+    case "syncError":
+      return [
+        ...current.filter(
+          (item) =>
+            item.kind !== "syncError" || item.syncVersion > next.syncVersion,
+        ),
+        next,
+      ];
+  }
+}
+
 function shouldRenderConversationItem(item: ConversationTurnItem): boolean {
   switch (item.type) {
     case "userMessage":
@@ -757,6 +877,8 @@ const DEFAULT_EFFORT_OPTIONS = [
 const EFFORT_ORDER: ReadonlyArray<string> = DEFAULT_EFFORT_OPTIONS;
 const INITIAL_VISIBLE_CHAT_ITEMS = 90;
 const VISIBLE_CHAT_ITEMS_STEP = 80;
+const DEFAULT_THREAD_WINDOW_ITEM_LIMIT =
+  INITIAL_VISIBLE_CHAT_ITEMS + VISIBLE_CHAT_ITEMS_STEP;
 const APP_DEFAULT_VALUE = "__app_default__";
 const ASSUMED_APP_DEFAULT_EFFORT = "medium";
 const AGENT_CACHE_TTL_MS = 30_000;
@@ -1385,7 +1507,11 @@ export function App(): React.JSX.Element {
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedReasoningEffort, setSelectedReasoningEffort] = useState("");
   const [isBusy, setIsBusy] = useState(false);
+  const [steeringPromptQueue, setSteeringPromptQueueState] = useState<
+    SteeringPromptQueueItem[]
+  >([]);
   const [isCoreLoading, setIsCoreLoading] = useState(initialSnapshot === null);
+  const [isSidebarRefreshing, setIsSidebarRefreshing] = useState(false);
   const [isSelectedThreadLoading, setIsSelectedThreadLoading] = useState(
     initialSnapshot === null && initialUiState.threadId !== null,
   );
@@ -1454,6 +1580,13 @@ export function App(): React.JSX.Element {
     initialTab,
   );
   const realtimeSocketRef = useRef<UnifiedRealtimeSocket | null>(null);
+  const pendingRealtimeMessagesRef = useRef<PendingRealtimeMessage[]>([]);
+  const realtimeFlushFrameRef = useRef<number | null>(null);
+  const latestRealtimeSyncVersionRef = useRef(0);
+  const steeringPromptQueueRef = useRef<SteeringPromptQueueItem[]>([]);
+  const steeringPromptQueueCounterRef = useRef(0);
+  const steeringPromptQueueDrainActiveRef = useRef(false);
+  const selectedAgentChangeObservedRef = useRef(false);
   const mobileSidebarSwipeRef = useRef<MobileSidebarSwipeGesture | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const chatContentRef = useRef<HTMLDivElement>(null);
@@ -1493,6 +1626,25 @@ export function App(): React.JSX.Element {
   const modelsSignatureRef = useRef<string[]>([]);
   const historyDetailCacheRef = useRef<Map<string, HistoryDetail>>(new Map());
   const historyDetailRequestIdRef = useRef(0);
+
+  const replaceSteeringPromptQueue = useCallback(
+    (nextItems: SteeringPromptQueueItem[]) => {
+      steeringPromptQueueRef.current = nextItems;
+      setSteeringPromptQueueState(nextItems);
+    },
+    [],
+  );
+
+  const updateSteeringPromptQueue = useCallback(
+    (
+      updater: (
+        currentItems: SteeringPromptQueueItem[],
+      ) => SteeringPromptQueueItem[],
+    ) => {
+      replaceSteeringPromptQueue(updater(steeringPromptQueueRef.current));
+    },
+    [replaceSteeringPromptQueue],
+  );
 
   /* Derived */
   const selectedThread = useMemo(
@@ -1656,6 +1808,16 @@ export function App(): React.JSX.Element {
       readThreadState?.thread.id === selectedThreadId ? readThreadState : null,
     [readThreadState, selectedThreadId],
   );
+  const activeThreadWindow = useMemo(
+    () =>
+      activeReadThreadState?.window ??
+      activeLiveState?.conversationStateWindow ??
+      null,
+    [
+      activeLiveState?.conversationStateWindow,
+      activeReadThreadState?.window,
+    ],
+  );
   const activeOwnerClientId = activeLiveState?.ownerClientId ?? null;
   const conversationState = useMemo(
     () =>
@@ -1776,10 +1938,7 @@ export function App(): React.JSX.Element {
     "setCollaborationMode",
   );
   const canEditThreadMode =
-    !selectedThreadId ||
-    (hasResolvedSelectedThreadProvider &&
-      (resolvedSelectedThreadProvider !== "codex" ||
-        Boolean(activeOwnerClientId)));
+    !selectedThreadId || hasResolvedSelectedThreadProvider;
   const canListModels = canUseFeature(activeAgentDescriptor, "listModels");
   const canListCollaborationModes = canUseFeature(
     activeAgentDescriptor,
@@ -1813,6 +1972,21 @@ export function App(): React.JSX.Element {
 
     return getLatestTokenUsageFromStreamEvents(streamEvents, selectedThreadId);
   }, [conversationState?.latestTokenUsageInfo, selectedThreadId, streamEvents]);
+  const visibleStreamEvents = useMemo(() => {
+    const events: StreamEventsResponse["events"] = [];
+    for (
+      let index = streamEvents.length - 1;
+      index >= 0 && events.length < DEBUG_STREAM_EVENT_RENDER_LIMIT;
+      index -= 1
+    ) {
+      const event = streamEvents[index];
+      if (event !== undefined) {
+        events.push(event);
+      }
+    }
+    return events;
+  }, [streamEvents]);
+  const hiddenStreamEventCount = streamEvents.length - visibleStreamEvents.length;
 
   const planModeOption = useMemo(
     () => modes.find((mode) => isPlanModeOption(mode)) ?? null,
@@ -1926,19 +2100,16 @@ export function App(): React.JSX.Element {
   const turns = conversationState?.turns ?? [];
   const lastTurn = turns[turns.length - 1];
   const isGenerating = isTurnInProgressStatus(lastTurn?.status);
-  const canSendToActiveThreadOwner =
-    !selectedThreadId ||
-    activeThreadAgentId !== "codex" ||
-    Boolean(activeOwnerClientId);
-  const hasActiveThreadConversationState =
-    !selectedThreadId || conversationState !== null;
+  const canSteerActiveThread =
+    Boolean(selectedThreadId) &&
+    !isModeSyncing &&
+    hasResolvedSelectedThreadProvider &&
+    canSendMessageForActiveAgent;
   const canUseComposer = isGenerating
-    ? canInterruptForActiveAgent
+    ? canSteerActiveThread || canInterruptForActiveAgent
     : selectedThreadId
       ? !isModeSyncing &&
-        hasActiveThreadConversationState &&
         hasResolvedSelectedThreadProvider &&
-        canSendToActiveThreadOwner &&
         canSendMessageForActiveAgent
       : availableAgentIds.length > 0 &&
         !isModeSyncing &&
@@ -1951,68 +2122,7 @@ export function App(): React.JSX.Element {
       turnIndex: number;
       turnIsInProgress: boolean;
     };
-    type IndexedConversationTurn = {
-      turnIndex: number;
-      entries: IndexedConversationItem[];
-    };
 
-    const renderableTurns: IndexedConversationTurn[] = [];
-    for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
-      const turn = turns[turnIndex];
-      if (!turn) {
-        continue;
-      }
-      const items = turn.items ?? [];
-      const isLastTurn = turnIndex === turns.length - 1;
-      const turnInProgress = isLastTurn && isGenerating;
-
-      const entries: IndexedConversationItem[] = [];
-      for (
-        let itemIndexInTurn = 0;
-        itemIndexInTurn < items.length;
-        itemIndexInTurn += 1
-      ) {
-        const item = items[itemIndexInTurn];
-        if (!item || !shouldRenderConversationItem(item)) {
-          continue;
-        }
-        entries.push({
-          key: item.id ?? `${turnIndex}-${itemIndexInTurn}`,
-          item,
-          turnIndex,
-          turnIsInProgress: turnInProgress,
-        });
-      }
-
-      if (entries.length > 0) {
-        renderableTurns.push({
-          turnIndex,
-          entries,
-        });
-      }
-    }
-
-    let startTurnIndex = renderableTurns.length;
-    let visibleCount = 0;
-    for (
-      let renderableTurnIndex = renderableTurns.length - 1;
-      renderableTurnIndex >= 0;
-      renderableTurnIndex -= 1
-    ) {
-      const renderableTurn = renderableTurns[renderableTurnIndex];
-      if (!renderableTurn) {
-        continue;
-      }
-      visibleCount += renderableTurn.entries.length;
-      startTurnIndex = renderableTurnIndex;
-      if (visibleCount >= visibleChatItemLimit) {
-        break;
-      }
-    }
-
-    const visibleEntries = renderableTurns
-      .slice(startTurnIndex)
-      .flatMap((renderableTurn) => renderableTurn.entries);
     const compactTimelineItemTypes: readonly ConversationTurnItem["type"][] = [
       "commandExecution",
       "fileChange",
@@ -2031,6 +2141,91 @@ export function App(): React.JSX.Element {
       item: FlatConversationItem["item"] | undefined,
     ): boolean =>
       item !== undefined && compactTimelineItemTypes.includes(item.type);
+
+    const turnHasRenderableItems = (turnIndex: number): boolean => {
+      const turn = turns[turnIndex];
+      if (!turn) {
+        return false;
+      }
+      const items = turn.items ?? [];
+      for (const item of items) {
+        if (item && shouldRenderConversationItem(item)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const collectTurnEntries = (turnIndex: number): IndexedConversationItem[] => {
+      const turn = turns[turnIndex];
+      if (!turn) {
+        return [];
+      }
+      const items = turn.items ?? [];
+      const isLastTurn = turnIndex === turns.length - 1;
+      const turnInProgress = isLastTurn && isGenerating;
+      const entries: IndexedConversationItem[] = [];
+
+      for (
+        let itemIndexInTurn = 0;
+        itemIndexInTurn < items.length;
+        itemIndexInTurn += 1
+      ) {
+        const item = items[itemIndexInTurn];
+        if (!item || !shouldRenderConversationItem(item)) {
+          continue;
+        }
+        entries.push({
+          key: item.id ?? `${turnIndex}-${itemIndexInTurn}`,
+          item,
+          turnIndex,
+          turnIsInProgress: turnInProgress,
+        });
+      }
+
+      return entries;
+    };
+
+    const hasRenderableTurnBefore = (turnIndex: number): boolean => {
+      for (
+        let previousTurnIndex = turnIndex - 1;
+        previousTurnIndex >= 0;
+        previousTurnIndex -= 1
+      ) {
+        if (turnHasRenderableItems(previousTurnIndex)) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const visibleTurnsReversed: IndexedConversationItem[][] = [];
+    let visibleCount = 0;
+    let hasHidden = false;
+
+    for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+      const entries = collectTurnEntries(turnIndex);
+      if (entries.length > 0) {
+        visibleTurnsReversed.push(entries);
+        visibleCount += entries.length;
+        if (visibleCount >= visibleChatItemLimit) {
+          hasHidden = hasRenderableTurnBefore(turnIndex);
+          break;
+        }
+      }
+    }
+
+    const visibleEntries: IndexedConversationItem[] = [];
+    for (
+      let turnIndex = visibleTurnsReversed.length - 1;
+      turnIndex >= 0;
+      turnIndex -= 1
+    ) {
+      const entries = visibleTurnsReversed[turnIndex];
+      if (entries) {
+        visibleEntries.push(...entries);
+      }
+    }
 
     const visibleItems: FlatConversationItem[] = visibleEntries.map(
       (entry, index) => {
@@ -2055,13 +2250,22 @@ export function App(): React.JSX.Element {
     );
 
     return {
-      hasHidden: startTurnIndex > 0,
+      hasHidden,
       visibleItems,
     };
   }, [isGenerating, turns, visibleChatItemLimit]);
-  const hasHiddenChatItems = conversationWindow.hasHidden;
+  const hasHiddenChatItems =
+    conversationWindow.hasHidden ||
+    activeThreadWindow?.range.hasMoreBefore === true;
   const visibleConversationItems = conversationWindow.visibleItems;
   const visibleConversationItemCount = visibleConversationItems.length;
+  const activeSteeringPromptQueue = useMemo(
+    () =>
+      selectedThreadId
+        ? steeringPromptQueue.filter((item) => item.threadId === selectedThreadId)
+        : [],
+    [selectedThreadId, steeringPromptQueue],
+  );
   const commitLabel = health?.state.gitCommit ?? "unknown";
   const scrollChatToBottom = useCallback(() => {
     const scroller = scrollRef.current;
@@ -2133,9 +2337,6 @@ export function App(): React.JSX.Element {
       : Promise.resolve(cachedAgents.value);
 
     const healthPromise = getHealth();
-    const rateLimitsPromise = DISABLE_RATE_LIMITS
-      ? Promise.resolve(null)
-      : getAccountRateLimits().catch(() => null);
     const sidebarPromise = listSidebarThreads({
       limit: 80,
       archived: false,
@@ -2150,6 +2351,7 @@ export function App(): React.JSX.Element {
       : Promise.resolve<HistoryResponse | null>(null);
 
     const nt = await sidebarPromise;
+    setIsSidebarRefreshing(nt.refreshing ?? false);
     const incomingThreads = sortThreadsByRecency(nt.rows);
     const optimisticSelectedThreadIds = optimisticSelectedThreadIdsRef.current;
     if (optimisticSelectedThreadIds.size > 0) {
@@ -2193,13 +2395,12 @@ export function App(): React.JSX.Element {
       return sortedThreads;
     });
 
-    const [healthResult, agentsResult, traceResult, historyResult, rateLimitsResult] =
+    const [healthResult, agentsResult, traceResult, historyResult] =
       await Promise.allSettled([
         healthPromise,
         agentsPromise,
         tracePromise,
         historyPromise,
-        rateLimitsPromise,
       ]);
 
     if (healthResult.status === "rejected") {
@@ -2214,15 +2415,10 @@ export function App(): React.JSX.Element {
     if (historyResult.status === "rejected") {
       console.error("Failed to load debug history", historyResult.reason);
     }
-    if (rateLimitsResult.status === "rejected") {
-      console.error("Failed to load account rate limits", rateLimitsResult.reason);
-    }
-
     const nh = healthResult.status === "fulfilled" ? healthResult.value : null;
     const nag = agentsResult.status === "fulfilled" ? agentsResult.value : null;
     const ntr = traceResult.status === "fulfilled" ? traceResult.value : null;
     const nhist = historyResult.status === "fulfilled" ? historyResult.value : null;
-    const nrl = rateLimitsResult.status === "fulfilled" ? rateLimitsResult.value : null;
 
     const nextAgents = nag?.agents ?? agentDescriptors;
     const nextDefaultAgentId = nag?.defaultAgentId ?? selectedAgentId;
@@ -2312,9 +2508,6 @@ export function App(): React.JSX.Element {
         }
         return nhist.history;
       });
-    }
-    if (nrl) {
-      setRateLimits(nrl);
     }
     if (nag) {
       setAgentDescriptors((prev) => {
@@ -2463,6 +2656,9 @@ export function App(): React.JSX.Element {
     ) => {
       const includeTurns = options?.includeTurns ?? true;
       const includeStreamEvents = options?.includeStreamEvents ?? includeTurns;
+      const itemLimit = includeTurns
+        ? (options?.itemLimit ?? DEFAULT_THREAD_WINDOW_ITEM_LIMIT)
+        : undefined;
       const shouldTrackSelectedLoad = selectedThreadIdRef.current === threadId;
       const selectedLoadRequestId = selectedThreadLoadRequestIdRef.current + 1;
       if (shouldTrackSelectedLoad) {
@@ -2497,6 +2693,7 @@ export function App(): React.JSX.Element {
           read = await readThread(threadId, {
             includeTurns,
             provider: candidateProvider,
+            ...(itemLimit ? { itemLimit } : {}),
           });
           threadAgentId = read.thread.provider;
           break;
@@ -2513,6 +2710,7 @@ export function App(): React.JSX.Element {
       if (!read) {
         read = await readThread(threadId, {
           includeTurns,
+          ...(itemLimit ? { itemLimit } : {}),
         });
         threadAgentId = read.thread.provider;
       }
@@ -2538,16 +2736,20 @@ export function App(): React.JSX.Element {
         read = await readThread(threadId, {
           includeTurns: true,
           provider: threadAgentId,
+          itemLimit: options?.itemLimit ?? DEFAULT_THREAD_WINDOW_ITEM_LIMIT,
         });
       }
 
       const live = canReadLiveState
-        ? await getLiveState(threadId, threadAgentId)
+        ? await getLiveState(threadId, threadAgentId, {
+            ...(itemLimit ? { itemLimit } : {}),
+          })
         : {
             ok: true as const,
             threadId,
             ownerClientId: null,
             conversationState: null,
+            conversationStateWindow: null,
             liveStateError: null,
           };
 
@@ -2555,14 +2757,12 @@ export function App(): React.JSX.Element {
         read = await readThread(threadId, {
           includeTurns: true,
           provider: threadAgentId,
+          itemLimit: options?.itemLimit ?? DEFAULT_THREAD_WINDOW_ITEM_LIMIT,
         });
         shouldReadTurns = true;
       }
       const shouldLoadStreamEvents =
-        canReadStreamEvents &&
-        (activeTabRef.current === "debug" ||
-          (threadAgentId === "codex" && selectedThreadIdRef.current === threadId)) &&
-        (includeStreamEvents || threadAgentId === "codex");
+        canReadStreamEvents && includeStreamEvents;
       const shouldUpdateSelectedThread =
         selectedThreadIdRef.current === threadId;
       const existingCachedState = cachedThreadState;
@@ -2704,6 +2904,28 @@ export function App(): React.JSX.Element {
     ],
   );
 
+  const showOlderChatItems = useCallback(() => {
+    const nextVisibleLimit = visibleChatItemLimit + VISIBLE_CHAT_ITEMS_STEP;
+    setVisibleChatItemLimit(nextVisibleLimit);
+
+    if (
+      !selectedThreadIdRef.current ||
+      activeThreadWindow?.range.hasMoreBefore !== true
+    ) {
+      return;
+    }
+
+    const nextItemLimit = Math.max(
+      activeThreadWindow.range.maxItems + VISIBLE_CHAT_ITEMS_STEP,
+      nextVisibleLimit + VISIBLE_CHAT_ITEMS_STEP,
+    );
+    void loadSelectedThread(selectedThreadIdRef.current, {
+      includeTurns: true,
+      includeStreamEvents: activeTabRef.current === "debug",
+      itemLimit: nextItemLimit,
+    });
+  }, [activeThreadWindow, loadSelectedThread, visibleChatItemLimit]);
+
   const refreshAll = useCallback(async () => {
     try {
       setError("");
@@ -2711,7 +2933,7 @@ export function App(): React.JSX.Element {
       if (selectedThreadIdRef.current)
         await loadSelectedThread(selectedThreadIdRef.current, {
           includeTurns: true,
-          includeStreamEvents: true,
+          includeStreamEvents: activeTabRef.current === "debug",
         });
     } catch (e) {
       setError(toErrorMessage(e));
@@ -2770,6 +2992,7 @@ export function App(): React.JSX.Element {
           ? prev
           : coreState.sidebar.errors,
       );
+      setIsSidebarRefreshing(coreState.sidebar.refreshing ?? false);
 
       setThreads((previousThreads) => {
         const nextThreads = mergeIncomingThreads(
@@ -2890,24 +3113,33 @@ export function App(): React.JSX.Element {
 
   const applyRealtimeThreadState = useCallback(
     (threadState: UnifiedRealtimeThreadState) => {
-      if (threadState.readThread) {
+      const readThread = threadState.readThreadWindow
+        ? materializeUnifiedThreadWindow(threadState.readThreadWindow)
+        : null;
+      const liveConversationState = threadState.liveState.conversationStateWindow
+        ? materializeUnifiedThreadWindow(threadState.liveState.conversationStateWindow)
+        : null;
+
+      if (readThread) {
         threadProviderByIdRef.current.set(
-          threadState.readThread.id,
-          threadState.readThread.provider,
+          readThread.id,
+          readThread.provider,
         );
       }
 
       const nextReadThreadState: ReadThreadResponse | null =
-        threadState.readThread
+        readThread
           ? {
-              thread: threadState.readThread,
+              thread: readThread,
+              window: threadState.readThreadWindow,
             }
           : null;
       const nextLiveState: LiveStateResponse = {
         ok: true,
         threadId: threadState.threadId,
         ownerClientId: threadState.liveState.ownerClientId,
-        conversationState: threadState.liveState.conversationState,
+        conversationState: liveConversationState,
+        conversationStateWindow: threadState.liveState.conversationStateWindow,
         liveStateError: threadState.liveState.liveStateError,
       };
       const nextStreamEvents = threadState.streamEvents;
@@ -2922,44 +3154,105 @@ export function App(): React.JSX.Element {
         return;
       }
 
-      setReadThreadState(nextReadThreadState);
-      setLiveState(nextLiveState);
-      setStreamEvents(nextStreamEvents);
+      setReadThreadState((prev) => {
+        if (
+          buildReadThreadSyncSignature(prev) ===
+          buildReadThreadSyncSignature(nextReadThreadState)
+        ) {
+          return prev;
+        }
+        return nextReadThreadState;
+      });
+      setLiveState((prev) => {
+        if (
+          buildLiveStateSyncSignature(prev) ===
+          buildLiveStateSyncSignature(nextLiveState)
+        ) {
+          return prev;
+        }
+        return nextLiveState;
+      });
+      setStreamEvents((prev) =>
+        haveSameStreamEvents(prev, nextStreamEvents) ? prev : nextStreamEvents,
+      );
     },
     [],
   );
 
+  const clearPendingRealtimeMessages = useCallback(() => {
+    pendingRealtimeMessagesRef.current = [];
+    if (realtimeFlushFrameRef.current !== null) {
+      window.cancelAnimationFrame(realtimeFlushFrameRef.current);
+      realtimeFlushFrameRef.current = null;
+    }
+  }, []);
+
+  const flushRealtimeMessages = useCallback(() => {
+    realtimeFlushFrameRef.current = null;
+    const pendingMessages = pendingRealtimeMessagesRef.current;
+    pendingRealtimeMessagesRef.current = [];
+
+    if (pendingMessages.length === 0) {
+      return;
+    }
+
+    startTransition(() => {
+      for (const message of pendingMessages) {
+        if (message.syncVersion <= latestRealtimeSyncVersionRef.current) {
+          continue;
+        }
+
+        latestRealtimeSyncVersionRef.current = message.syncVersion;
+
+        if (message.kind === "snapshot") {
+          applyRealtimeCoreState(message.core);
+          if (message.selectedThread) {
+            applyRealtimeThreadState(message.selectedThread);
+          }
+          continue;
+        }
+
+        if (message.kind === "coreDelta") {
+          applyRealtimeCoreState(message.core);
+          continue;
+        }
+
+        if (message.kind === "threadDelta") {
+          applyRealtimeThreadState(message.thread);
+          continue;
+        }
+
+        if (message.kind === "debugDelta") {
+          setTraceStatus(toTraceStatusState(message.traceStatus));
+          setHistory(message.history);
+          continue;
+        }
+
+        if (message.kind === "syncError") {
+          setError(message.message);
+        }
+      }
+    });
+  }, [applyRealtimeCoreState, applyRealtimeThreadState]);
+
   const handleRealtimeMessage = useCallback(
     (message: UnifiedRealtimeServerMessage) => {
-      if (message.kind === "snapshot") {
-        applyRealtimeCoreState(message.core);
-        if (message.selectedThread) {
-          applyRealtimeThreadState(message.selectedThread);
-        }
+      const nextPendingMessages = appendRealtimeMessage(
+        pendingRealtimeMessagesRef.current,
+        message,
+        latestRealtimeSyncVersionRef.current,
+      );
+      if (nextPendingMessages === pendingRealtimeMessagesRef.current) {
         return;
       }
-
-      if (message.kind === "coreDelta") {
-        applyRealtimeCoreState(message.core);
+      pendingRealtimeMessagesRef.current = nextPendingMessages;
+      if (realtimeFlushFrameRef.current !== null) {
         return;
       }
-
-      if (message.kind === "threadDelta") {
-        applyRealtimeThreadState(message.thread);
-        return;
-      }
-
-      if (message.kind === "debugDelta") {
-        setTraceStatus(toTraceStatusState(message.traceStatus));
-        setHistory(message.history);
-        return;
-      }
-
-      if (message.kind === "syncError") {
-        setError(message.message);
-      }
+      realtimeFlushFrameRef.current =
+        window.requestAnimationFrame(flushRealtimeMessages);
     },
-    [applyRealtimeCoreState, applyRealtimeThreadState],
+    [flushRealtimeMessages],
   );
 
   useEffect(() => {
@@ -3038,7 +3331,7 @@ export function App(): React.JSX.Element {
           selectedThreadId && loadThread
             ? loadThread(selectedThreadId, {
                 includeTurns: true,
-                includeStreamEvents: true,
+                includeStreamEvents: activeTabRef.current === "debug",
               })
             : Promise.resolve();
         await Promise.all([corePromise, threadPromise]);
@@ -3049,6 +3342,10 @@ export function App(): React.JSX.Element {
   }, []);
 
   useEffect(() => {
+    if (!selectedAgentChangeObservedRef.current) {
+      selectedAgentChangeObservedRef.current = true;
+      return;
+    }
     const loadCore = loadCoreDataRef.current;
     if (!loadCore) {
       return;
@@ -3193,10 +3490,13 @@ export function App(): React.JSX.Element {
     const socket = createUnifiedRealtimeSocket({
       socketUrl: unifiedWebSocketUrl,
       onConnect: () => {
+        latestRealtimeSyncVersionRef.current = 0;
+        clearPendingRealtimeMessages();
         socket.send({
           kind: "hello",
           selectedThreadId: selectedThreadIdRef.current,
           activeTab: activeTabRef.current,
+          supportedCodecs: [UNIFIED_REALTIME_TRANSPORT_CODEC_PROTOBUF_GZIP],
         });
       },
       onDisconnect: () => {
@@ -3204,6 +3504,7 @@ export function App(): React.JSX.Element {
       },
       onProtocolError: (message) => {
         setError(message);
+        socket.send({ kind: "requestSnapshot" });
       },
       onMessage: (message) => {
         handleRealtimeMessage(message);
@@ -3243,12 +3544,13 @@ export function App(): React.JSX.Element {
 
     return () => {
       realtimeSocketRef.current = null;
+      clearPendingRealtimeMessages();
       document.removeEventListener("visibilitychange", onVisibilityChange);
       window.removeEventListener("pagehide", onPageHide);
       window.removeEventListener("pageshow", onPageShow);
       disconnectSocket();
     };
-  }, [handleRealtimeMessage, unifiedWebSocketUrl]);
+  }, [clearPendingRealtimeMessages, handleRealtimeMessage, unifiedWebSocketUrl]);
 
   useEffect(() => {
     if (!activeRequest) {
@@ -3480,6 +3782,149 @@ export function App(): React.JSX.Element {
   }, [activeTab, scrollChatToBottom, selectedThreadId]);
 
   /* Actions */
+  const drainSteeringPromptQueue = useCallback(async () => {
+    if (steeringPromptQueueDrainActiveRef.current) {
+      return;
+    }
+
+    steeringPromptQueueDrainActiveRef.current = true;
+    try {
+      for (;;) {
+        const nextItem =
+          steeringPromptQueueRef.current.find(
+            (item) => item.status === "pending",
+          ) ?? null;
+        if (!nextItem) {
+          return;
+        }
+
+        updateSteeringPromptQueue((currentItems) =>
+          currentItems.map((item) =>
+            item.id === nextItem.id ? { ...item, status: "sending" } : item,
+          ),
+        );
+
+        try {
+          await sendMessage({
+            provider: nextItem.provider,
+            threadId: nextItem.threadId,
+            text: nextItem.text,
+            ...(nextItem.ownerClientId
+              ? { ownerClientId: nextItem.ownerClientId }
+              : {}),
+            isSteering: true,
+          });
+          updateSteeringPromptQueue((currentItems) =>
+            currentItems.filter((item) => item.id !== nextItem.id),
+          );
+          void refreshAll();
+        } catch (e) {
+          const message = toErrorMessage(e);
+          updateSteeringPromptQueue((currentItems) =>
+            currentItems.map((item) =>
+              item.id === nextItem.id
+                ? { ...item, status: "failed", errorMessage: message }
+                : item,
+            ),
+          );
+          setError(message);
+          return;
+        }
+      }
+    } finally {
+      steeringPromptQueueDrainActiveRef.current = false;
+      if (
+        steeringPromptQueueRef.current.some(
+          (item) => item.status === "pending",
+        )
+      ) {
+        window.setTimeout(() => {
+          void drainSteeringPromptQueue();
+        }, 0);
+      }
+    }
+  }, [refreshAll, updateSteeringPromptQueue]);
+
+  const enqueueSteeringPrompt = useCallback(
+    async (draft: string) => {
+      const trimmedDraft = draft.trim();
+      if (!trimmedDraft) {
+        return;
+      }
+      if (!selectedThreadId) {
+        setError("No active thread selected");
+        return;
+      }
+      if (!hasResolvedSelectedThreadProvider) {
+        setError("Thread provider is still loading");
+        return;
+      }
+      if (!canSendMessageForActiveAgent) {
+        setError(`${activeAgentLabel} cannot steer this thread`);
+        return;
+      }
+
+      steeringPromptQueueCounterRef.current += 1;
+      const nextItem: SteeringPromptQueueItem = {
+        id: `steer-${Date.now()}-${steeringPromptQueueCounterRef.current}`,
+        threadId: selectedThreadId,
+        provider: activeThreadAgentId,
+        ownerClientId: activeOwnerClientId ?? null,
+        text: draft,
+        status: "pending",
+        createdAtMs: Date.now(),
+      };
+      updateSteeringPromptQueue((currentItems) => [
+        ...currentItems,
+        nextItem,
+      ]);
+      void drainSteeringPromptQueue();
+    },
+    [
+      activeAgentLabel,
+      activeOwnerClientId,
+      activeThreadAgentId,
+      canSendMessageForActiveAgent,
+      drainSteeringPromptQueue,
+      hasResolvedSelectedThreadProvider,
+      selectedThreadId,
+      updateSteeringPromptQueue,
+    ],
+  );
+
+  const retrySteeringPrompt = useCallback(
+    (itemId: string) => {
+      updateSteeringPromptQueue((currentItems) =>
+        currentItems.map((item) =>
+          item.id === itemId && item.status === "failed"
+            ? {
+                id: item.id,
+                threadId: item.threadId,
+                provider: item.provider,
+                ownerClientId: item.ownerClientId,
+                text: item.text,
+                status: "pending",
+                createdAtMs: item.createdAtMs,
+              }
+            : item,
+        ),
+      );
+      void drainSteeringPromptQueue();
+    },
+    [drainSteeringPromptQueue, updateSteeringPromptQueue],
+  );
+
+  const cancelSteeringPrompt = useCallback(
+    (itemId: string) => {
+      updateSteeringPromptQueue((currentItems) =>
+        currentItems.filter(
+          (item) => item.id !== itemId || item.status === "sending",
+        ),
+      );
+    },
+    [updateSteeringPromptQueue],
+  );
+
   const submitMessage = useCallback(
     async (draft: string) => {
       if (!draft.trim()) return;
@@ -3487,14 +3932,6 @@ export function App(): React.JSX.Element {
       if (isModeSyncing) return;
       if (selectedThreadId && !hasResolvedSelectedThreadProvider) {
         setError("Thread provider is still loading");
-        return;
-      }
-      if (selectedThreadId && !hasActiveThreadConversationState) {
-        setError("Thread state is still loading");
-        return;
-      }
-      if (selectedThreadId && !canSendToActiveThreadOwner) {
-        setError("Codex thread owner is still loading");
         return;
       }
 
@@ -3583,9 +4020,7 @@ export function App(): React.JSX.Element {
       activeThreadAgentId,
       activeOwnerClientId,
       canSendMessageForActiveAgent,
-      canSendToActiveThreadOwner,
       conversationState,
-      hasActiveThreadConversationState,
       hasResolvedSelectedThreadProvider,
       isModeSyncing,
       models,
@@ -4075,14 +4510,14 @@ export function App(): React.JSX.Element {
 
       <div className="relative flex-1 min-h-0">
         <div className="h-full min-h-0 overflow-y-auto overflow-x-hidden py-2 pl-2 pr-0">
-          {threads.length === 0 && (
+          {threads.length === 0 &&
+            (isCoreLoading || isSidebarRefreshing) && (
+              <SidebarThreadSkeletonList />
+            )}
+          {threads.length === 0 && !isCoreLoading && !isSidebarRefreshing && (
             <div className="px-4 py-6 text-xs text-muted-foreground text-center space-y-3">
               <div>
-                {isCoreLoading ? (
-                  <span className="reasoning-shimmer font-medium">
-                    Loading threads...
-                  </span>
-                ) : sidebarProviderConnectionState ? (
+                {sidebarProviderConnectionState ? (
                   <div className="space-y-3">
                     <div className="space-y-1">
                       <div className="text-sm font-medium text-foreground">
@@ -4121,8 +4556,7 @@ export function App(): React.JSX.Element {
                   "No threads"
                 )}
               </div>
-              {!isCoreLoading &&
-                !sidebarProviderConnectionState &&
+              {!sidebarProviderConnectionState &&
                 availableAgentIds.length > 0 &&
                 (availableAgentIds.length === 1 ? (
                   <Button
@@ -4786,6 +5220,34 @@ export function App(): React.JSX.Element {
                     </span>
                   )}
                 </div>
+                <div className="md:hidden mt-0.5 flex min-w-0 items-center gap-1 overflow-hidden text-[10px] leading-4 text-muted-foreground">
+                  {isGenerating && (
+                    <span className="shrink-0 rounded-full bg-success/12 px-1.5 text-success">
+                      Running
+                    </span>
+                  )}
+                  {activeRequest && (
+                    <span className="shrink-0 rounded-full bg-amber-500/12 px-1.5 text-amber-500 dark:text-amber-300">
+                      Input
+                    </span>
+                  )}
+                  {activeApprovalRequest && (
+                    <span className="shrink-0 rounded-full bg-amber-500/12 px-1.5 text-amber-500 dark:text-amber-300">
+                      Approval
+                    </span>
+                  )}
+                  {activeSteeringPromptQueue.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-blue-500/12 px-1.5 text-blue-500 dark:text-blue-300">
+                      {activeSteeringPromptQueue.length} queued
+                    </span>
+                  )}
+                  <span className="truncate">
+                    {selectedModelLabel}
+                    {selectedReasoningEffortLabel
+                      ? ` / ${selectedReasoningEffortLabel}`
+                      : ""}
+                  </span>
+                </div>
               </div>
             </div>
 
@@ -5026,11 +5488,7 @@ export function App(): React.JSX.Element {
                   visibleConversationItems={visibleConversationItems}
                   isChatAtBottom={isChatAtBottom}
                   onSelectThread={handleSelectReferencedThread}
-                  onShowOlder={() => {
-                    setVisibleChatItemLimit(
-                      (limit) => limit + VISIBLE_CHAT_ITEMS_STEP,
-                    );
-                  }}
+                  onShowOlder={showOlderChatItems}
                   onScrollToBottom={() => {
                     scrollChatToBottom();
                     isChatAtBottomRef.current = true;
@@ -5100,21 +5558,113 @@ export function App(): React.JSX.Element {
                             )}
                           </AnimatePresence>
 
+                          <AnimatePresence initial={false}>
+                            {activeSteeringPromptQueue.length > 0 && (
+                              <motion.div
+                                initial={{ opacity: 0, y: 6 }}
+                                animate={{ opacity: 1, height: "auto" }}
+                                exit={{ opacity: 0, y: 6 }}
+                                transition={{ duration: 0.15 }}
+                                className="overflow-hidden rounded-xl border border-border/70 bg-card/95 px-3 py-2 shadow-sm"
+                              >
+                                <div className="mb-1.5 flex items-center justify-between gap-2 text-xs">
+                                  <span className="font-medium text-foreground">
+                                    Steering queue
+                                  </span>
+                                  <span className="text-muted-foreground">
+                                    {activeSteeringPromptQueue.length}
+                                  </span>
+                                </div>
+                                <div className="space-y-1.5">
+                                  {activeSteeringPromptQueue.map((item) => (
+                                    <div
+                                      key={item.id}
+                                      className="flex items-start gap-2 rounded-lg bg-muted/45 px-2 py-1.5"
+                                    >
+                                      <div className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-muted-foreground">
+                                        {item.status === "sending" ? (
+                                          <Loader2
+                                            size={12}
+                                            className="animate-spin"
+                                          />
+                                        ) : item.status === "failed" ? (
+                                          <X size={12} />
+                                        ) : (
+                                          <ArrowUp size={12} />
+                                        )}
+                                      </div>
+                                      <div className="min-w-0 flex-1">
+                                        <div className="line-clamp-2 text-xs leading-5 text-foreground">
+                                          {item.text}
+                                        </div>
+                                        {item.status === "failed" &&
+                                          item.errorMessage && (
+                                            <div className="mt-0.5 truncate text-[11px] text-destructive">
+                                              {item.errorMessage}
+                                            </div>
+                                          )}
+                                      </div>
+                                      {item.status === "failed" ? (
+                                        <Button
+                                          type="button"
+                                          variant="ghost"
+                                          size="sm"
+                                          className="h-6 shrink-0 rounded-md px-2 text-[11px]"
+                                          onClick={() =>
+                                            retrySteeringPrompt(item.id)
+                                          }
+                                        >
+                                          Retry
+                                        </Button>
+                                      ) : item.status === "pending" ? (
+                                        <Button
+                                          type="button"
+                                          variant="ghost"
+                                          size="icon"
+                                          className="h-6 w-6 shrink-0 rounded-md text-muted-foreground hover:text-foreground"
+                                          title="Remove"
+                                          aria-label="Remove queued steer"
+                                          onClick={() =>
+                                            cancelSteeringPrompt(item.id)
+                                          }
+                                        >
+                                          <X size={12} />
+                                        </Button>
+                                      ) : null}
+                                    </div>
+                                  ))}
+                                </div>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+
                           <ChatComposer
-                            canSend={canUseComposer}
+                            canSend={
+                              isGenerating ? canSteerActiveThread : canUseComposer
+                            }
+                            canInterrupt={
+                              canInterruptForActiveAgent &&
+                              hasResolvedSelectedThreadProvider
+                            }
                             isBusy={isBusy}
                             isGenerating={isGenerating}
                             placeholder={
-                              selectedThreadId
+                              isGenerating
+                                ? `Steer ${activeAgentLabel}…`
+                                : selectedThreadId
                                 ? `Message ${activeAgentLabel}…`
                                 : `Message ${selectedAgentLabel}…`
                             }
                             onInterrupt={runInterrupt}
-                            onSend={submitMessage}
+                            onSend={
+                              isGenerating
+                                ? enqueueSteeringPrompt
+                                : submitMessage
+                            }
                           />
 
                           {/* Toolbar */}
-                          <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                          <div className="flex min-w-0 items-center gap-1.5 overflow-x-auto pb-0.5 sm:flex-wrap sm:overflow-visible">
                             {canSetCollaborationMode &&
                               canListCollaborationModes && (
                                 <Button
@@ -5398,14 +5948,19 @@ export function App(): React.JSX.Element {
                         <span className="text-xs text-muted-foreground/60">
                           {streamEvents.length}
                         </span>
+                        {hiddenStreamEventCount > 0 && (
+                          <span className="text-xs text-muted-foreground/60">
+                            Latest {visibleStreamEvents.length}
+                          </span>
+                        )}
                       </div>
                       <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
-                        {streamEvents
-                          .slice()
-                          .reverse()
-                          .map((evt, i) => (
-                            <StreamEventCard key={i} event={evt} />
-                          ))}
+                        {visibleStreamEvents.map((evt, i) => (
+                          <StreamEventCard
+                            key={streamEvents.length - i - 1}
+                            event={evt}
+                          />
+                        ))}
                       </div>
                     </div>
                   </div>

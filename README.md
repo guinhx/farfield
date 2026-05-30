@@ -1,10 +1,12 @@
 # Farfield
 
+> **Fork notice:** this repository is the `guinhx/farfield` fork of Farfield, originally created by [@anshuchimala](https://x.com/anshuchimala). This fork keeps the Codex desktop sync contract intact while focusing on continuous improvements: mobile and remote usability, payload efficiency, realtime stability, frontend responsiveness, and stricter schemas and tests. Upstream project: [achimala/farfield](https://github.com/achimala/farfield).
+
 Remote control for AI coding agents — read conversations, send messages, switch models, and monitor agent activity from a clean web UI.
 
 Supports [Codex](https://openai.com/codex) and [OpenCode](https://opencode.ai).
 
-Built by [@anshuchimala](https://x.com/anshuchimala).
+Originally built by [@anshuchimala](https://x.com/anshuchimala).
 
 This is an independent project and is not affiliated with, endorsed by, or sponsored by OpenAI or the OpenCode team.
 

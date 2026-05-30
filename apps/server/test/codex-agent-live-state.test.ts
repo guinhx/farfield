@@ -5,6 +5,7 @@ import {
   ThreadConversationRequestSchema,
   parseThreadConversationState,
   type AppServerListThreadsResponse,
+  type AppServerGetAccountRateLimitsResponse,
   type AppServerReadThreadResponse,
   type AppServerServerRequest,
   type IpcFrame,
@@ -15,6 +16,7 @@ import {
 } from "@farfield/protocol";
 import {
   AppServerRpcError,
+  AppServerTransportError,
   DesktopIpcError,
   type AppServerNotificationListener,
   type AppServerRequestListener,
@@ -42,8 +44,12 @@ const readThreadIncludeTurnsCalls: boolean[] = [];
 
 let readThreadResponse: AppServerReadThreadResponse;
 let listThreadsResponse: AppServerListThreadsResponse;
+let readRateLimitsResponse: AppServerGetAccountRateLimitsResponse;
+let listThreadsError: Error | null = null;
 let readThreadError: Error | null = null;
+let readRateLimitsError: Error | null = null;
 let ipcRequestError: Error | null = null;
+let ipcInitializeError: Error | null = null;
 
 vi.mock("@farfield/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@farfield/api")>();
@@ -78,7 +84,21 @@ vi.mock("@farfield/api", async (importOriginal) => {
     public async listThreads(
       _options: object,
     ): Promise<AppServerListThreadsResponse> {
+      if (listThreadsError) {
+        const error = listThreadsError;
+        listThreadsError = null;
+        throw error;
+      }
       return listThreadsResponse;
+    }
+
+    public async readAccountRateLimits(): Promise<AppServerGetAccountRateLimitsResponse> {
+      if (readRateLimitsError) {
+        const error = readRateLimitsError;
+        readRateLimitsError = null;
+        throw error;
+      }
+      return readRateLimitsResponse;
     }
 
     public async listLoadedThreads(_options: object): Promise<{
@@ -175,6 +195,11 @@ vi.mock("@farfield/api", async (importOriginal) => {
     }
 
     public async initialize(_userAgent: string) {
+      if (ipcInitializeError) {
+        const error = ipcInitializeError;
+        ipcInitializeError = null;
+        throw error;
+      }
       return IpcResponseFrameSchema.parse({
         type: "response",
         requestId: "initialize-1",
@@ -394,12 +419,18 @@ describe("CodexAgentAdapter app-server pending requests", () => {
     ipcRequestCalls.splice(0, ipcRequestCalls.length);
     readThreadCalls.splice(0, readThreadCalls.length);
     readThreadIncludeTurnsCalls.splice(0, readThreadIncludeTurnsCalls.length);
+    listThreadsError = null;
     readThreadError = null;
+    readRateLimitsError = null;
     ipcRequestError = null;
+    ipcInitializeError = null;
 
     listThreadsResponse = {
       data: [],
       nextCursor: null,
+    };
+    readRateLimitsResponse = {
+      rateLimits: {},
     };
     readThreadResponse = {
       thread: createThreadState("thread-default"),
@@ -441,6 +472,66 @@ describe("CodexAgentAdapter app-server pending requests", () => {
     });
   });
 
+  it("keeps app readiness when thread list reads time out after startup", async () => {
+    const adapter = createAdapter();
+    await adapter.start();
+    expect(adapter.getRuntimeState().appReady).toBe(true);
+
+    listThreadsError = new AppServerTransportError(
+      "app-server request timed out: thread/list",
+    );
+
+    await expect(
+      adapter.listThreads({
+        limit: 80,
+        archived: false,
+        all: false,
+        maxPages: 1,
+        cursor: null,
+      }),
+    ).rejects.toThrow("app-server request timed out: thread/list");
+
+    expect(adapter.getRuntimeState().appReady).toBe(true);
+    expect(adapter.getRuntimeState().lastError).toBe(
+      "app-server request timed out: thread/list",
+    );
+  });
+
+  it("keeps app readiness when the startup thread list read times out", async () => {
+    listThreadsError = new AppServerTransportError(
+      "app-server request timed out: thread/list",
+    );
+    const adapter = createAdapter();
+
+    await adapter.start();
+
+    expect(adapter.getRuntimeState().appReady).toBe(true);
+    expect(adapter.getRuntimeState().ipcConnected).toBe(true);
+    expect(adapter.getRuntimeState().ipcInitialized).toBe(true);
+    expect(adapter.getRuntimeState().lastError).toBe(
+      "app-server request timed out: thread/list",
+    );
+  });
+
+  it("keeps app readiness when rate limit reads time out after startup", async () => {
+    const adapter = createAdapter();
+    await adapter.start();
+    expect(adapter.getRuntimeState().appReady).toBe(true);
+
+    readRateLimitsError = new AppServerTransportError(
+      "app-server request timed out: account/rateLimits/read",
+    );
+
+    await expect(adapter.readRateLimits()).rejects.toThrow(
+      "app-server request timed out: account/rateLimits/read",
+    );
+
+    expect(adapter.getRuntimeState().appReady).toBe(true);
+    expect(adapter.getRuntimeState().lastError).toBe(
+      "app-server request timed out: account/rateLimits/read",
+    );
+  });
+
   it("does not schedule app-server reads after desktop-owned sends", async () => {
     const threadId = "thread-owned-send-no-read-refresh";
     const adapter = createAdapter();
@@ -458,6 +549,64 @@ describe("CodexAgentAdapter app-server pending requests", () => {
 
     expect(startTurnCalls).toEqual([]);
     expect(readThreadCalls).toEqual([]);
+  });
+
+  it("routes owned thread sends through connected desktop IPC when initialize times out", async () => {
+    const threadId = "thread-owned-send-connected";
+    const adapter = createAdapter();
+    readThreadResponse = {
+      thread: createThreadState(threadId),
+    };
+    ipcInitializeError = new DesktopIpcError("IPC initialize request timed out");
+    await adapter.start();
+
+    await adapter.sendMessage({
+      threadId,
+      ownerClientId: "client-1",
+      text: "hello from Farfield",
+      model: "gpt-5.5",
+    });
+
+    expect(startTurnCalls).toEqual([]);
+    expect(ipcRequestCalls).toContainEqual({
+      method: "thread-follower-start-turn",
+      params: {
+        conversationId: threadId,
+        turnStartParams: {
+          threadId,
+          input: [{ type: "text", text: "hello from Farfield" }],
+          model: "gpt-5.5",
+          attachments: [],
+        },
+        isSteering: false,
+      },
+      options: {
+        targetClientId: "client-1",
+        version: 1,
+      },
+    });
+  });
+
+  it("rejects owned thread sends when desktop IPC is disconnected", async () => {
+    const threadId = "thread-owned-send-disconnected";
+    const adapter = createAdapter();
+    readThreadResponse = {
+      thread: createThreadState(threadId),
+    };
+
+    await expect(
+      adapter.sendMessage({
+        threadId,
+        ownerClientId: "client-1",
+        text: "hello from Farfield",
+        model: "gpt-5.5",
+      }),
+    ).rejects.toThrow(
+      `Codex desktop owner for thread ${threadId} is no longer connected`,
+    );
+
+    expect(startTurnCalls).toEqual([]);
+    expect(ipcRequestCalls).toEqual([]);
   });
 
   it("uses app-server turn start when desktop IPC is unavailable", async () => {
@@ -986,6 +1135,44 @@ describe("CodexAgentAdapter app-server pending requests", () => {
         version: 1,
       },
     });
+  });
+
+  it("rejects desktop-ready user input submissions when no owner client is registered", async () => {
+    const threadId = "thread-unregistered-owner-user-input-request";
+    const requestId = 31;
+    const adapter = createAdapter();
+    readThreadResponse = {
+      thread: createThreadState(threadId, [
+        ThreadConversationRequestSchema.parse(
+          createUserInputRequest(threadId, requestId),
+        ),
+      ]),
+    };
+
+    await adapter.start();
+    await adapter.readThread({
+      threadId,
+      includeTurns: true,
+    });
+
+    await expect(
+      adapter.submitUserInput({
+        threadId,
+        requestId,
+        response: {
+          answers: {
+            choice: {
+              answers: ["A"],
+            },
+          },
+        },
+      }),
+    ).rejects.toThrow(
+      `Codex desktop owner for thread ${threadId} is not registered`,
+    );
+
+    expect(submitUserInputCalls).toEqual([]);
+    expect(ipcRequestCalls).toEqual([]);
   });
 
   it("submits unowned user input requests to app server", async () => {

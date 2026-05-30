@@ -14,8 +14,9 @@ const isLocalHost =
   window.location.hostname === "localhost" ||
   window.location.hostname === "127.0.0.1" ||
   window.location.hostname === "::1";
+const canUseServiceWorkers = window.isSecureContext;
 
-if (import.meta.env.DEV || isLocalHost) {
+if (canUseServiceWorkers && (import.meta.env.DEV || isLocalHost)) {
   void navigator.serviceWorker
     .getRegistrations()
     .then((registrations) =>
@@ -26,7 +27,7 @@ if (import.meta.env.DEV || isLocalHost) {
     .catch((error) => {
       console.error("Failed to unregister service workers", error);
     });
-} else {
+} else if (canUseServiceWorkers) {
   registerSW({ immediate: true });
 }
 

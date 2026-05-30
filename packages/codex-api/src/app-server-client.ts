@@ -125,6 +125,9 @@ const AppServerLoadedThreadListResponseSchema = z
 
 type AppServerLoadedThreadListResponse = z.infer<typeof AppServerLoadedThreadListResponseSchema>;
 
+const THREAD_LIST_REQUEST_TIMEOUT_MS = 8_000;
+const RATE_LIMITS_REQUEST_TIMEOUT_MS = 5_000;
+
 export class AppServerClient {
   private readonly transport: AppServerTransport;
 
@@ -151,14 +154,24 @@ export class AppServerClient {
     return this.transport.onServerRequest(listener);
   }
 
-  public async listThreads(options: ListThreadsOptions): Promise<AppServerListThreadsResponse> {
-    const result = await this.transport.request("thread/list", {
-      limit: options.limit,
-      archived: options.archived,
-      cursor: options.cursor ?? null
-    });
+  public async listThreads(
+    options: ListThreadsOptions
+  ): Promise<AppServerListThreadsResponse> {
+    const result = await this.transport.request(
+      "thread/list",
+      {
+        limit: options.limit,
+        archived: options.archived,
+        cursor: options.cursor ?? null
+      },
+      THREAD_LIST_REQUEST_TIMEOUT_MS
+    );
 
-    return parseWithSchema(AppServerListThreadsResponseSchema, result, "AppServerListThreadsResponse");
+    return parseWithSchema(
+      AppServerListThreadsResponseSchema,
+      result,
+      "AppServerListThreadsResponse"
+    );
   }
 
   public async listLoadedThreads(
@@ -244,7 +257,11 @@ export class AppServerClient {
   }
 
   public async readAccountRateLimits(): Promise<AppServerGetAccountRateLimitsResponse> {
-    const result = await this.transport.request("account/rateLimits/read", {});
+    const result = await this.transport.request(
+      "account/rateLimits/read",
+      {},
+      RATE_LIMITS_REQUEST_TIMEOUT_MS
+    );
     return parseWithSchema(
       AppServerGetAccountRateLimitsResponseSchema,
       result,

@@ -18,6 +18,53 @@ const START_THREAD_RESPONSE = {
   reasoningEffort: null,
 };
 
+describe("AppServerClient lightweight reads", () => {
+  it("bounds thread list requests", async () => {
+    const transport: AppServerTransport = {
+      request: vi.fn().mockResolvedValue({ data: [], nextCursor: null }),
+      respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const client = new AppServerClient(transport);
+    await client.listThreads({
+      limit: 80,
+      archived: false,
+    });
+
+    expect(transport.request).toHaveBeenCalledWith(
+      "thread/list",
+      {
+        limit: 80,
+        archived: false,
+        cursor: null,
+      },
+      8_000,
+    );
+  });
+
+  it("bounds rate limit requests", async () => {
+    const transport: AppServerTransport = {
+      request: vi.fn().mockResolvedValue({ rateLimits: {} }),
+      respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
+      close: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const client = new AppServerClient(transport);
+    await client.readAccountRateLimits();
+
+    expect(transport.request).toHaveBeenCalledWith(
+      "account/rateLimits/read",
+      {},
+      5_000,
+    );
+  });
+});
+
 describe("AppServerClient.startThread", () => {
   it("sets ephemeral to false when it is not provided", async () => {
     const transport: AppServerTransport = {

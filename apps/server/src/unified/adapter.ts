@@ -4,6 +4,7 @@ import {
   UserInputRequestSchema,
 } from "@farfield/protocol";
 import {
+  buildUnifiedThreadWindow,
   JsonValueSchema,
   UnifiedFeatureMatrixSchema,
   UNIFIED_COMMAND_KINDS,
@@ -270,10 +271,18 @@ function createHandlerTable(
         threadId: command.threadId,
         includeTurns: command.includeTurns,
       });
+      const thread = mapThread(provider, result.thread);
 
       return {
         kind: "readThread",
-        thread: mapThread(provider, result.thread),
+        thread,
+        ...(command.itemLimit && command.includeTurns
+          ? {
+              threadWindow: buildUnifiedThreadWindow(thread, {
+                maxItems: command.itemLimit,
+              }),
+            }
+          : {}),
       };
     },
 
@@ -463,13 +472,25 @@ function createHandlerTable(
       }
 
       const liveState = await adapter.readLiveState(command.threadId);
+      const conversationState = liveState.conversationState
+        ? mapThread(provider, liveState.conversationState)
+        : null;
       return {
         kind: "readLiveState",
         threadId: command.threadId,
         ownerClientId: liveState.ownerClientId,
-        conversationState: liveState.conversationState
-          ? mapThread(provider, liveState.conversationState)
-          : null,
+        conversationState:
+          conversationState && command.itemLimit
+            ? null
+            : conversationState,
+        ...(conversationState && command.itemLimit
+          ? {
+              conversationStateWindow: buildUnifiedThreadWindow(
+                conversationState,
+                { maxItems: command.itemLimit },
+              ),
+            }
+          : {}),
         ...(liveState.liveStateError
           ? { liveStateError: liveState.liveStateError }
           : {}),

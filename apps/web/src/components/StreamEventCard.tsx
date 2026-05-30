@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { z } from "zod";
 import type { JsonValue } from "@farfield/unified-surface";
@@ -31,7 +31,7 @@ const StreamEventSchema = z
   })
   .passthrough();
 
-export function StreamEventCard({
+export const StreamEventCard = memo(function StreamEventCard({
   event,
 }: {
   event: JsonValue;
@@ -87,4 +87,4 @@ export function StreamEventCard({
       )}
     </div>
   );
-}
+});

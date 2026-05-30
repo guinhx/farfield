@@ -1,4 +1,4 @@
-import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import http, { type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import path from "node:path";
 import fs from "node:fs";
@@ -18,9 +18,13 @@ import type {
 import { Server as SocketServer } from "socket.io";
 import { z } from "zod";
 import {
+  buildUnifiedThreadWindow,
+  UNIFIED_BINARY_HTTP_CONTENT_TYPE,
   UnifiedCommandSchema,
+  JsonValueSchema,
   UnifiedRealtimeCoreStateSchema,
   UnifiedRealtimeThreadStateSchema,
+  encodeUnifiedPayloadFrame,
   type JsonValue,
   type UnifiedEventKind,
   type UnifiedFeatureAvailability,
@@ -53,12 +57,14 @@ import {
   createUnifiedProviderAdapters,
   mapThread,
 } from "./unified/adapter.js";
+import { resolveCodexExecutablePath } from "./codex-executable.js";
 import { RealtimeCoordinator } from "./realtime/coordinator.js";
 import {
   ServerTimingTracker,
   type ServerTimingMetricId,
   type ServerTimingSnapshot,
 } from "./perf-metrics.js";
+import { readUnifiedBody } from "./http-body.js";
 
 const HOST = process.env["HOST"] ?? "127.0.0.1";
 const PORT = Number(process.env["PORT"] ?? 4311);
@@ -67,7 +73,17 @@ const USER_AGENT = "farfield/0.2.5";
 const IPC_RECONNECT_DELAY_MS = 1_000;
 const SIDEBAR_PREVIEW_MAX_CHARS = 180;
 const SIDEBAR_CORE_CACHE_TTL_MS = 1_000;
+const SIDEBAR_CORE_STALE_TTL_MS = 45_000;
+const SIDEBAR_ERROR_PAUSE_MS = 20_000;
 const RATE_LIMITS_CACHE_TTL_MS = 5_000;
+const RATE_LIMITS_ERROR_PAUSE_MS = 20_000;
+const REPEATED_WARNING_INTERVAL_MS = 60_000;
+const PROJECT_DIRECTORIES_CACHE_TTL_MS = 30_000;
+const PROJECT_DIRECTORIES_ERROR_PAUSE_MS = 20_000;
+const DEFAULT_THREAD_WINDOW_ITEM_LIMIT = 170;
+const THREAD_WINDOW_ITEM_LIMIT_MAX = 2_000;
+const RATE_LIMITS_PAUSED_ERROR_MESSAGE =
+  "Rate limit reading is paused after a recent app-server error";
 const CORE_RELEVANT_CODEX_NOTIFICATION_METHODS = new Set<
   AppServerServerNotificationMethod
 >([
@@ -154,19 +170,6 @@ interface RuntimeStateSnapshot {
   timings: ServerTimingSnapshot;
 }
 
-function resolveCodexExecutablePath(): string {
-  if (process.env["CODEX_CLI_PATH"]) {
-    return process.env["CODEX_CLI_PATH"];
-  }
-
-  const desktopPath = "/Applications/Codex.app/Contents/Resources/codex";
-  if (fs.existsSync(desktopPath)) {
-    return desktopPath;
-  }
-
-  return "codex";
-}
-
 function resolveIpcSocketPath(): string {
   if (process.env["CODEX_IPC_SOCKET"]) {
     return process.env["CODEX_IPC_SOCKET"];
@@ -221,39 +224,29 @@ function parseBoolean(value: string | null, fallback: boolean): boolean {
   return fallback;
 }
 
+const ThreadWindowItemLimitQuerySchema = z
+  .string()
+  .regex(/^\d+$/)
+  .transform((value) => Number(value))
+  .pipe(z.number().int().positive().max(THREAD_WINDOW_ITEM_LIMIT_MAX));
+
 function jsonResponse(
   res: ServerResponse,
   statusCode: number,
   body: unknown,
 ): void {
-  const encoded = Buffer.from(JSON.stringify(body), "utf8");
+  const encoded = Buffer.from(
+    encodeUnifiedPayloadFrame(JsonValueSchema.parse(body)),
+  );
   res.writeHead(statusCode, {
-    "Content-Type": "application/json; charset=utf-8",
+    "Content-Type": UNIFIED_BINARY_HTTP_CONTENT_TYPE,
     "Content-Length": encoded.length,
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Headers": "content-type,accept",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Vary": "Accept",
   });
   res.end(encoded);
-}
-
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-
-  for await (const chunk of req) {
-    if (typeof chunk === "string") {
-      chunks.push(Buffer.from(chunk, "utf8"));
-      continue;
-    }
-    chunks.push(chunk as Buffer);
-  }
-
-  const raw = Buffer.concat(chunks).toString("utf8").trim();
-  if (!raw) {
-    return {};
-  }
-
-  return JSON.parse(raw);
 }
 
 function toErrorMessage(error: unknown): string {
@@ -547,6 +540,7 @@ interface UnifiedListThreadsResponse {
 interface UnifiedSidebarResponse {
   rows: UnifiedThreadSummary[];
   errors: Record<UnifiedProviderId, ProviderErrorPayload | null>;
+  refreshing?: boolean;
 }
 
 interface UnifiedThreadListInput {
@@ -558,8 +552,13 @@ interface UnifiedThreadListInput {
 }
 
 interface SidebarCacheEntry {
-  expiresAtMs: number;
+  refreshAfterMs: number;
+  discardAfterMs: number;
   value: UnifiedSidebarResponse;
+}
+
+interface SidebarReadOptions {
+  waitForInitial: boolean;
 }
 
 interface RateLimitsCacheEntry {
@@ -567,11 +566,132 @@ interface RateLimitsCacheEntry {
   value: AppServerGetAccountRateLimitsResponse;
 }
 
+interface ProjectDirectoriesCacheEntry {
+  expiresAtMs: number;
+  directories: string[];
+}
+
+interface WarningThrottleEntry {
+  nextLogAtMs: number;
+  suppressedCount: number;
+}
+
 const sidebarCacheByKey = new Map<string, SidebarCacheEntry>();
 const sidebarInFlightByKey = new Map<string, Promise<UnifiedSidebarResponse>>();
+const sidebarRetryAfterByKey = new Map<string, number>();
 let rateLimitsCacheEntry: RateLimitsCacheEntry | null = null;
 let rateLimitsInFlight: Promise<AppServerGetAccountRateLimitsResponse> | null =
   null;
+let rateLimitsRetryAfterMs = 0;
+const warningThrottleByKey = new Map<string, WarningThrottleEntry>();
+const projectDirectoriesCacheByProvider = new Map<
+  UnifiedProviderId,
+  ProjectDirectoriesCacheEntry
+>();
+const projectDirectoriesInFlightByProvider = new Map<
+  UnifiedProviderId,
+  Promise<void>
+>();
+const projectDirectoriesRetryAfterByProvider = new Map<UnifiedProviderId, number>();
+
+function logRepeatedWarning(
+  key: string,
+  event: string,
+  payload: Record<string, JsonValue>,
+): void {
+  const nowMs = Date.now();
+  const current = warningThrottleByKey.get(key);
+  if (current && current.nextLogAtMs > nowMs) {
+    warningThrottleByKey.set(key, {
+      nextLogAtMs: current.nextLogAtMs,
+      suppressedCount: current.suppressedCount + 1,
+    });
+    return;
+  }
+
+  const suppressedCount = current?.suppressedCount ?? 0;
+  warningThrottleByKey.set(key, {
+    nextLogAtMs: nowMs + REPEATED_WARNING_INTERVAL_MS,
+    suppressedCount: 0,
+  });
+  logger.warn(
+    {
+      ...payload,
+      ...(suppressedCount > 0 ? { suppressedCount } : {}),
+    },
+    event,
+  );
+}
+
+function startProjectDirectoriesRefresh(provider: UnifiedProviderId): void {
+  if (projectDirectoriesInFlightByProvider.has(provider)) {
+    return;
+  }
+
+  const adapter = resolveUnifiedAdapter(provider);
+  if (!adapter) {
+    return;
+  }
+
+  const promise = adapter
+    .execute({
+      kind: "listProjectDirectories",
+      provider,
+    })
+    .then((result) => {
+      if (result.kind !== "listProjectDirectories") {
+        return;
+      }
+
+      projectDirectoriesRetryAfterByProvider.delete(provider);
+      projectDirectoriesCacheByProvider.set(provider, {
+        expiresAtMs: Date.now() + PROJECT_DIRECTORIES_CACHE_TTL_MS,
+        directories: result.directories,
+      });
+      queueCoreDelta?.();
+    })
+    .catch((error) => {
+      projectDirectoriesRetryAfterByProvider.set(
+        provider,
+        Date.now() + PROJECT_DIRECTORIES_ERROR_PAUSE_MS,
+      );
+      logRepeatedWarning(
+        `project-directories:${provider}`,
+        "project-directories-read-failed",
+        {
+          provider,
+          error: toErrorMessage(error),
+        },
+      );
+    })
+    .finally(() => {
+      projectDirectoriesInFlightByProvider.delete(provider);
+    });
+
+  projectDirectoriesInFlightByProvider.set(provider, promise);
+}
+
+function readProjectDirectoriesForRealtime(
+  provider: UnifiedProviderId,
+  enabled: boolean,
+): string[] {
+  if (!enabled) {
+    return [];
+  }
+
+  const nowMs = Date.now();
+  const cached = projectDirectoriesCacheByProvider.get(provider);
+  if (cached && cached.expiresAtMs > nowMs) {
+    return cached.directories;
+  }
+
+  const retryAfterMs = projectDirectoriesRetryAfterByProvider.get(provider) ?? 0;
+  if (retryAfterMs <= nowMs) {
+    startProjectDirectoriesRefresh(provider);
+  }
+
+  return cached?.directories ?? [];
+}
 
 function providerLabel(provider: UnifiedProviderId): string {
   return provider === "codex" ? "Codex" : "OpenCode";
@@ -705,12 +825,13 @@ async function listUnifiedThreads(
             provider,
           },
         };
-        logger.warn(
+        logRepeatedWarning(
+          `thread-list:${provider}`,
+          "unified-list-threads-failed",
           {
             provider,
             error: message,
           },
-          "unified-list-threads-failed",
         );
       }
     }),
@@ -733,6 +854,7 @@ async function listUnifiedSidebarThreads(
       preview: compactSidebarPreview(thread.preview),
     })),
     errors: result.errors,
+    refreshing: false,
   };
 }
 
@@ -746,28 +868,94 @@ function buildSidebarCacheKey(input: UnifiedThreadListInput): string {
   ].join(":");
 }
 
-async function listUnifiedSidebarThreadsShared(
+function buildEmptySidebarResponse(): UnifiedSidebarResponse {
+  return {
+    rows: [],
+    errors: {
+      codex: null,
+      opencode: null,
+    },
+    refreshing: true,
+  };
+}
+
+function markSidebarRefreshing(
+  value: UnifiedSidebarResponse,
+): UnifiedSidebarResponse {
+  return {
+    ...value,
+    refreshing: true,
+  };
+}
+
+function hasSidebarRefreshError(value: UnifiedSidebarResponse): boolean {
+  return (
+    value.errors.codex?.code === "listThreadsFailed" ||
+    value.errors.opencode?.code === "listThreadsFailed"
+  );
+}
+
+function isSidebarCacheUsable(
+  entry: SidebarCacheEntry,
+  nowMs: number,
+): boolean {
+  return entry.discardAfterMs > nowMs;
+}
+
+function storeSidebarCacheEntry(
+  key: string,
+  value: UnifiedSidebarResponse,
+  nowMs: number,
+): void {
+  sidebarCacheByKey.set(key, {
+    refreshAfterMs: nowMs + SIDEBAR_CORE_CACHE_TTL_MS,
+    discardAfterMs: nowMs + SIDEBAR_CORE_STALE_TTL_MS,
+    value,
+  });
+}
+
+function startSidebarRefresh(
+  key: string,
   input: UnifiedThreadListInput,
 ): Promise<UnifiedSidebarResponse> {
-  const key = buildSidebarCacheKey(input);
-  const nowMs = Date.now();
-  const cached = sidebarCacheByKey.get(key);
-  if (cached && cached.expiresAtMs > nowMs) {
-    return cached.value;
-  }
-
-  const inFlight = sidebarInFlightByKey.get(key);
-  if (inFlight) {
-    return inFlight;
-  }
-
   const promise = listUnifiedSidebarThreads(input)
     .then((value) => {
-      sidebarCacheByKey.set(key, {
-        expiresAtMs: Date.now() + SIDEBAR_CORE_CACHE_TTL_MS,
-        value,
-      });
+      const nowMs = Date.now();
+      if (hasSidebarRefreshError(value)) {
+        sidebarRetryAfterByKey.set(key, nowMs + SIDEBAR_ERROR_PAUSE_MS);
+        const cached = sidebarCacheByKey.get(key);
+        if (cached && isSidebarCacheUsable(cached, nowMs)) {
+          return markSidebarRefreshing(cached.value);
+        }
+      } else {
+        sidebarRetryAfterByKey.delete(key);
+      }
+
+      storeSidebarCacheEntry(key, value, nowMs);
+      queueCoreDelta?.();
       return value;
+    })
+    .catch((error) => {
+      const nowMs = Date.now();
+      sidebarRetryAfterByKey.set(key, nowMs + SIDEBAR_ERROR_PAUSE_MS);
+      const cached = sidebarCacheByKey.get(key);
+      if (cached && isSidebarCacheUsable(cached, nowMs)) {
+        return markSidebarRefreshing(cached.value);
+      }
+      return {
+        rows: [],
+        errors: {
+          codex: {
+            code: "listThreadsFailed",
+            message: toErrorMessage(error),
+            details: {
+              provider: "codex",
+            },
+          },
+          opencode: null,
+        },
+        refreshing: true,
+      };
     })
     .finally(() => {
       sidebarInFlightByKey.delete(key);
@@ -776,18 +964,61 @@ async function listUnifiedSidebarThreadsShared(
   return promise;
 }
 
+async function listUnifiedSidebarThreadsShared(
+  input: UnifiedThreadListInput,
+  options: SidebarReadOptions,
+): Promise<UnifiedSidebarResponse> {
+  const key = buildSidebarCacheKey(input);
+  const nowMs = Date.now();
+  const cached = sidebarCacheByKey.get(key);
+  if (cached && cached.refreshAfterMs > nowMs) {
+    return cached.value;
+  }
+
+  const inFlight = sidebarInFlightByKey.get(key);
+  if (inFlight) {
+    if (cached && isSidebarCacheUsable(cached, nowMs)) {
+      return markSidebarRefreshing(cached.value);
+    }
+    if (options.waitForInitial) {
+      return inFlight;
+    }
+    return buildEmptySidebarResponse();
+  }
+
+  const retryAfterMs = sidebarRetryAfterByKey.get(key) ?? 0;
+  if (retryAfterMs > nowMs) {
+    if (cached && isSidebarCacheUsable(cached, nowMs)) {
+      return markSidebarRefreshing(cached.value);
+    }
+    return buildEmptySidebarResponse();
+  }
+
+  const promise = startSidebarRefresh(key, input);
+  if (cached && isSidebarCacheUsable(cached, nowMs)) {
+    return markSidebarRefreshing(cached.value);
+  }
+  if (options.waitForInitial) {
+    return promise;
+  }
+  return buildEmptySidebarResponse();
+}
+
 async function buildRealtimeCoreState() {
   const startedAt = performance.now();
   try {
     const [sidebar, rateLimits, features] = await Promise.all([
       timeServerOperation("realtimeCoreSidebarList", () =>
-        listUnifiedSidebarThreadsShared({
-          limit: 80,
-          archived: false,
-          all: false,
-          maxPages: 1,
-          cursor: null,
-        }),
+        listUnifiedSidebarThreadsShared(
+          {
+            limit: 80,
+            archived: false,
+            all: false,
+            maxPages: 1,
+            cursor: null,
+          },
+          { waitForInitial: false },
+        ),
       ),
       timeServerOperation("realtimeCoreRateLimits", () =>
         readRateLimitsForRealtime(),
@@ -808,23 +1039,10 @@ async function buildRealtimeCoreState() {
             const providerFeatures = features[provider];
             const enabled = registry.getAdapter(provider)?.isEnabled() ?? false;
             const connected = registry.getAdapter(provider)?.isConnected() ?? false;
-            const adapter = resolveUnifiedAdapter(provider);
-            let projectDirectories: string[] = [];
-
-            if (
-              adapter &&
-              isFeatureAvailable(providerFeatures.listProjectDirectories)
-            ) {
-              try {
-                const result = await adapter.execute({
-                  kind: "listProjectDirectories",
-                  provider,
-                });
-                projectDirectories = result.directories;
-              } catch {
-                projectDirectories = [];
-              }
-            }
+            const projectDirectories = readProjectDirectoriesForRealtime(
+              provider,
+              isFeatureAvailable(providerFeatures.listProjectDirectories),
+            );
 
             return {
               id: provider,
@@ -1022,10 +1240,12 @@ async function buildRealtimeThreadState(input: {
 
     return UnifiedRealtimeThreadStateSchema.parse({
       threadId: input.threadId,
-      readThread,
+      readThreadWindow: buildUnifiedThreadWindow(readThread, {
+        maxItems: DEFAULT_THREAD_WINDOW_ITEM_LIMIT,
+      }),
       liveState: {
         ownerClientId: liveResult.ownerClientId,
-        conversationState: null,
+        conversationStateWindow: null,
         liveStateError: liveResult.liveStateError ?? null,
       },
       streamEvents: streamResult.events,
@@ -1061,12 +1281,16 @@ async function readRateLimitsForRealtime():
     return rateLimitsCacheEntry.value;
   }
 
+  if (rateLimitsInFlight || rateLimitsRetryAfterMs > nowMs) {
+    return rateLimitsCacheEntry?.value ?? null;
+  }
+
   void readRateLimitsShared()
     .then(() => {
       queueCoreDelta?.();
     })
     .catch(() => undefined);
-  return null;
+  return rateLimitsCacheEntry?.value ?? null;
 }
 
 async function readRateLimitsShared():
@@ -1080,6 +1304,14 @@ async function readRateLimitsShared():
     return rateLimitsInFlight;
   }
 
+  if (rateLimitsRetryAfterMs > nowMs && rateLimitsCacheEntry) {
+    return rateLimitsCacheEntry.value;
+  }
+
+  if (rateLimitsRetryAfterMs > nowMs) {
+    throw new Error(RATE_LIMITS_PAUSED_ERROR_MESSAGE);
+  }
+
   const adapter = registry.resolveFirstWithCapability("canReadRateLimits");
   if (!adapter || !adapter.readRateLimits) {
     throw new Error("No agent supports rate limit reading");
@@ -1088,11 +1320,16 @@ async function readRateLimitsShared():
   rateLimitsInFlight = adapter
     .readRateLimits()
     .then((value) => {
+      rateLimitsRetryAfterMs = 0;
       rateLimitsCacheEntry = {
         expiresAtMs: Date.now() + RATE_LIMITS_CACHE_TTL_MS,
         value,
       };
       return value;
+    })
+    .catch((error) => {
+      rateLimitsRetryAfterMs = Date.now() + RATE_LIMITS_ERROR_PAUSE_MS;
+      throw error;
     })
     .finally(() => {
       rateLimitsInFlight = null;
@@ -1349,7 +1586,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/unified/command") {
-      const command = UnifiedCommandSchema.parse(await readJsonBody(req));
+      const command = UnifiedCommandSchema.parse(await readUnifiedBody(req));
       const adapter = resolveUnifiedAdapter(command.provider);
 
       if (!adapter) {
@@ -1441,17 +1678,21 @@ const server = http.createServer(async (req, res) => {
       const all = parseBoolean(url.searchParams.get("all"), false);
       const maxPages = parseInteger(url.searchParams.get("maxPages"), 20);
       const cursor = url.searchParams.get("cursor") ?? null;
-      const result = await listUnifiedSidebarThreadsShared({
-        limit,
-        archived,
-        all,
-        maxPages,
-        cursor,
-      });
+      const result = await listUnifiedSidebarThreadsShared(
+        {
+          limit,
+          archived,
+          all,
+          maxPages,
+          cursor,
+        },
+        { waitForInitial: false },
+      );
       jsonResponse(res, 200, {
         ok: true,
         rows: result.rows,
         errors: result.errors,
+        refreshing: result.refreshing ?? false,
       });
       return;
     }
@@ -1483,6 +1724,26 @@ const server = http.createServer(async (req, res) => {
         url.searchParams.get("includeTurns"),
         true,
       );
+      const rawItemLimit = url.searchParams.get("itemLimit");
+      const parsedItemLimit =
+        rawItemLimit === null
+          ? null
+          : ThreadWindowItemLimitQuerySchema.safeParse(rawItemLimit);
+      if (parsedItemLimit !== null && !parsedItemLimit.success) {
+        jsonResponse(res, 400, {
+          ok: false,
+          error: {
+            code: "invalidThreadWindowItemLimit",
+            message: `itemLimit must be a positive integer up to ${THREAD_WINDOW_ITEM_LIMIT_MAX}`,
+            details: {
+              itemLimit: rawItemLimit,
+            },
+          },
+        });
+        return;
+      }
+      const itemLimit =
+        parsedItemLimit === null ? null : parsedItemLimit.data;
       const knownProviders = threadIndex.providers(threadId);
       const resolvedProvider = threadIndex.resolve(threadId);
       let provider = providerFromQuery ?? resolvedProvider;
@@ -1593,10 +1854,21 @@ const server = http.createServer(async (req, res) => {
               });
 
         threadIndex.register(thread.id, thread.provider);
-        jsonResponse(res, 200, {
-          ok: true,
-          thread,
-        });
+        if (itemLimit !== null && includeTurns) {
+          jsonResponse(res, 200, {
+            ok: true,
+            shape: "threadWindow",
+            threadWindow: buildUnifiedThreadWindow(thread, {
+              maxItems: itemLimit,
+            }),
+          });
+        } else {
+          jsonResponse(res, 200, {
+            ok: true,
+            shape: "thread",
+            thread,
+          });
+        }
       } catch (error) {
         const message = toErrorMessage(error);
         jsonResponse(res, 500, {
@@ -1652,7 +1924,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (req.method === "POST" && pathname === "/api/debug/trace/start") {
-        const body = parseBody(TraceStartBodySchema, await readJsonBody(req));
+        const body = parseBody(TraceStartBodySchema, await readUnifiedBody(req));
         if (activeTrace) {
           jsonResponse(res, 409, {
             ok: false,
@@ -1695,7 +1967,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (req.method === "POST" && pathname === "/api/debug/trace/mark") {
-        const body = parseBody(TraceMarkBodySchema, await readJsonBody(req));
+        const body = parseBody(TraceMarkBodySchema, await readUnifiedBody(req));
         if (!activeTrace) {
           jsonResponse(res, 409, { ok: false, error: "No active trace" });
           return;
@@ -1784,7 +2056,13 @@ const server = http.createServer(async (req, res) => {
         jsonResponse(res, 200, { ok: true, ...result });
       } catch (error) {
         const message = toErrorMessage(error);
-        logger.warn({ error: message }, "rate-limits-read-failed");
+        if (message !== RATE_LIMITS_PAUSED_ERROR_MESSAGE) {
+          logRepeatedWarning(
+            "rate-limits-read",
+            "rate-limits-read-failed",
+            { error: message },
+          );
+        }
         jsonResponse(res, 500, { ok: false, error: message });
       }
       return;

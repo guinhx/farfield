@@ -1,7 +1,12 @@
 import {
+  UNIFIED_REALTIME_CLIENT_FRAME_EVENT,
+  UNIFIED_REALTIME_SERVER_FRAME_EVENT,
   UnifiedRealtimeClientMessageSchema,
   UnifiedRealtimeServerMessageSchema,
+  decodeUnifiedRealtimeClientMessageFrame,
+  encodeUnifiedRealtimeServerMessageFrame,
   type JsonValue,
+  type UnifiedRealtimeClientMessage,
   type UnifiedRealtimeCoreState,
   type UnifiedRealtimeServerMessage,
   type UnifiedRealtimeTab,
@@ -9,8 +14,8 @@ import {
 } from "@farfield/unified-surface";
 import type { Server, Socket } from "socket.io";
 
-export const REALTIME_CLIENT_EVENT = "unified-realtime-client-message";
-export const REALTIME_SERVER_EVENT = "unified-realtime-server-message";
+export const REALTIME_CLIENT_FRAME_EVENT = UNIFIED_REALTIME_CLIENT_FRAME_EVENT;
+export const REALTIME_SERVER_FRAME_EVENT = UNIFIED_REALTIME_SERVER_FRAME_EVENT;
 
 interface RealtimeClientContext {
   selectedThreadId: string | null;
@@ -21,6 +26,24 @@ interface RealtimeDebugState {
   traceStatus: UnifiedRealtimeCoreState["traceStatus"];
   history: UnifiedRealtimeCoreState["history"];
 }
+
+interface ThreadDeltaGroup {
+  threadId: string;
+  includeStreamEvents: boolean;
+  sockets: Socket[];
+}
+
+type ThreadDeltaBuildResult =
+  | {
+      ok: true;
+      group: ThreadDeltaGroup;
+      state: UnifiedRealtimeThreadState | null;
+    }
+  | {
+      ok: false;
+      group: ThreadDeltaGroup;
+      message: string;
+    };
 
 export interface RealtimeCoordinatorOptions {
   io: Server;
@@ -59,8 +82,19 @@ export class RealtimeCoordinator {
         activeTab: "chat",
       });
 
-      socket.on(REALTIME_CLIENT_EVENT, (payload: JsonValue) => {
-        this.handleClientMessage(socket, payload);
+      socket.on(REALTIME_CLIENT_FRAME_EVENT, (payload: Uint8Array | ArrayBuffer) => {
+        try {
+          this.handleClientMessage(
+            socket,
+            decodeUnifiedRealtimeClientMessageFrame(payload),
+          );
+        } catch (error) {
+          this.emitSyncError(
+            socket,
+            `Invalid realtime client frame: ${String(error)}`,
+            "invalidFrame",
+          );
+        }
       });
 
       socket.on("disconnect", () => {
@@ -97,49 +131,43 @@ export class RealtimeCoordinator {
     });
   }
 
-  private handleClientMessage(socket: Socket, payload: JsonValue): void {
-    const parsed = UnifiedRealtimeClientMessageSchema.safeParse(payload);
-    if (!parsed.success) {
-      this.emitSyncError(socket, "Invalid realtime client payload", "invalidPayload", {
-        issues: parsed.error.issues.map((issue) => ({
-          path: issue.path.join("."),
-          message: issue.message,
-        })),
-      });
-      return;
-    }
+  private handleClientMessage(
+    socket: Socket,
+    payload: UnifiedRealtimeClientMessage,
+  ): void {
+    const parsed = UnifiedRealtimeClientMessageSchema.parse(payload);
 
     const current = this.contextBySocketId.get(socket.id) ?? {
       selectedThreadId: null,
       activeTab: "chat" as const,
     };
 
-    if (parsed.data.kind === "hello") {
+    if (parsed.kind === "hello") {
       this.contextBySocketId.set(socket.id, {
-        selectedThreadId: parsed.data.selectedThreadId,
-        activeTab: parsed.data.activeTab,
+        selectedThreadId: parsed.selectedThreadId,
+        activeTab: parsed.activeTab,
       });
       void this.sendSnapshot(socket);
       return;
     }
 
-    if (parsed.data.kind === "selectionChanged") {
+    if (parsed.kind === "selectionChanged") {
       this.contextBySocketId.set(socket.id, {
-        selectedThreadId: parsed.data.selectedThreadId,
+        selectedThreadId: parsed.selectedThreadId,
         activeTab: current.activeTab,
       });
-      if (parsed.data.selectedThreadId) {
-        this.queueThreadDelta(parsed.data.selectedThreadId);
+      if (parsed.selectedThreadId) {
+        this.queueThreadDelta(parsed.selectedThreadId);
       }
       return;
     }
 
-    if (parsed.data.kind === "activeTabChanged") {
+    if (parsed.kind === "activeTabChanged") {
       this.contextBySocketId.set(socket.id, {
         selectedThreadId: current.selectedThreadId,
-        activeTab: parsed.data.activeTab,
+        activeTab: parsed.activeTab,
       });
-      if (parsed.data.activeTab === "debug") {
+      if (parsed.activeTab === "debug") {
         this.queueDebugDelta();
         if (current.selectedThreadId) {
           this.queueThreadDelta(current.selectedThreadId);
@@ -148,7 +176,7 @@ export class RealtimeCoordinator {
       return;
     }
 
-    if (parsed.data.kind === "requestSnapshot") {
+    if (parsed.kind === "requestSnapshot") {
       void this.sendSnapshot(socket);
     }
   }
@@ -161,22 +189,51 @@ export class RealtimeCoordinator {
         activeTab: "chat" as const,
       };
 
-      const selectedThread = context.selectedThreadId
-        ? await this.buildThreadState({
-            threadId: context.selectedThreadId,
-            includeStreamEvents: context.activeTab === "debug",
-          })
-        : null;
-
       this.emitMessage(socket, {
         kind: "snapshot",
         syncVersion: this.nextSyncVersion(),
         core: coreState,
-        selectedThread,
+        selectedThread: null,
+      });
+
+      if (context.selectedThreadId) {
+        void this.sendSelectedThreadDelta(
+          socket,
+          context.selectedThreadId,
+          context.activeTab,
+        );
+      }
+    } catch (error) {
+      this.emitSyncError(socket, String(error), "snapshotFailed");
+    }
+  }
+
+  private async sendSelectedThreadDelta(
+    socket: Socket,
+    threadId: string,
+    activeTab: UnifiedRealtimeTab,
+  ): Promise<void> {
+    try {
+      const thread = await this.buildThreadState({
+        threadId,
+        includeStreamEvents: activeTab === "debug",
+      });
+      const currentContext = this.contextBySocketId.get(socket.id);
+      if (
+        !thread ||
+        currentContext?.selectedThreadId !== threadId ||
+        currentContext.activeTab !== activeTab
+      ) {
+        return;
+      }
+
+      this.emitMessage(socket, {
+        kind: "threadDelta",
+        syncVersion: this.nextSyncVersion(),
+        thread,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.emitSyncError(socket, message, "snapshotFailed");
+      this.emitSyncError(socket, String(error), "threadDeltaFailed");
     }
   }
 
@@ -204,13 +261,13 @@ export class RealtimeCoordinator {
   private async flushPendingDeltas(): Promise<void> {
     const shouldSendCore = this.pendingCoreDelta;
     const shouldSendDebug = this.pendingDebugDelta;
-    const threadIds = Array.from(this.pendingThreadIds);
+    const threadIds = new Set(this.pendingThreadIds);
 
     this.pendingCoreDelta = false;
     this.pendingDebugDelta = false;
     this.pendingThreadIds.clear();
 
-    if (!shouldSendCore && !shouldSendDebug && threadIds.length === 0) {
+    if (!shouldSendCore && !shouldSendDebug && threadIds.size === 0) {
       return;
     }
 
@@ -231,45 +288,58 @@ export class RealtimeCoordinator {
           .catch((error) => ({ ok: false as const, error }))
       : null;
 
-    const threadStateCache = new Map<string, UnifiedRealtimeThreadState | null>();
+    const threadDeltaGroups = new Map<string, ThreadDeltaGroup>();
 
-    for (const [socketId, socket] of sockets.entries()) {
-      const context = this.contextBySocketId.get(socketId) ?? {
-        selectedThreadId: null,
-        activeTab: "chat" as const,
-      };
+    if (threadIds.size > 0) {
+      for (const [socketId, socket] of sockets.entries()) {
+        const context = this.contextBySocketId.get(socketId);
 
-      if (!context.selectedThreadId) {
-        continue;
-      }
+        if (!context?.selectedThreadId) {
+          continue;
+        }
 
-      if (!threadIds.includes(context.selectedThreadId)) {
-        continue;
-      }
+        if (!threadIds.has(context.selectedThreadId)) {
+          continue;
+        }
 
-      const streamKey = context.activeTab === "debug" ? "withStream" : "withoutStream";
-      const cacheKey = `${context.selectedThreadId}:${streamKey}`;
-      if (!threadStateCache.has(cacheKey)) {
-        threadStateCache.set(
-          cacheKey,
-          await this.buildThreadState({
+        const includeStreamEvents = context.activeTab === "debug";
+        const streamKey = includeStreamEvents ? "withStream" : "withoutStream";
+        const cacheKey = `${context.selectedThreadId}:${streamKey}`;
+        const existingGroup = threadDeltaGroups.get(cacheKey);
+        if (existingGroup) {
+          existingGroup.sockets.push(socket);
+        } else {
+          threadDeltaGroups.set(cacheKey, {
             threadId: context.selectedThreadId,
-            includeStreamEvents: context.activeTab === "debug",
-          }),
-        );
+            includeStreamEvents,
+            sockets: [socket],
+          });
+        }
       }
-
-      const state = threadStateCache.get(cacheKey) ?? null;
-      if (!state) {
-        continue;
-      }
-
-      this.emitMessage(socket, {
-        kind: "threadDelta",
-        syncVersion: this.nextSyncVersion(),
-        thread: state,
-      });
     }
+
+    const threadDeltaResultsPromise = Promise.all(
+      Array.from(threadDeltaGroups.values()).map(
+        async (group): Promise<ThreadDeltaBuildResult> => {
+          try {
+            return {
+              ok: true,
+              group,
+              state: await this.buildThreadState({
+                threadId: group.threadId,
+                includeStreamEvents: group.includeStreamEvents,
+              }),
+            };
+          } catch (error) {
+            return {
+              ok: false,
+              group,
+              message: String(error),
+            };
+          }
+        },
+      ),
+    );
 
     if (coreStatePromise) {
       const coreResult = await coreStatePromise;
@@ -281,13 +351,11 @@ export class RealtimeCoordinator {
           "coreDeltaFailed",
         );
       } else {
-        for (const socket of sockets.values()) {
-          this.emitMessage(socket, {
-            kind: "coreDelta",
-            syncVersion: this.nextSyncVersion(),
-            core: coreResult.core,
-          });
-        }
+        this.emitMessageToSockets(sockets.values(), {
+          kind: "coreDelta",
+          syncVersion: this.nextSyncVersion(),
+          core: coreResult.core,
+        });
       }
     }
 
@@ -301,6 +369,7 @@ export class RealtimeCoordinator {
           "debugDeltaFailed",
         );
       } else {
+        const debugSockets: Socket[] = [];
         for (const [socketId, socket] of sockets.entries()) {
           const context = this.contextBySocketId.get(socketId) ?? {
             selectedThreadId: null,
@@ -310,7 +379,11 @@ export class RealtimeCoordinator {
             continue;
           }
 
-          this.emitMessage(socket, {
+          debugSockets.push(socket);
+        }
+
+        if (debugSockets.length > 0) {
+          this.emitMessageToSockets(debugSockets, {
             kind: "debugDelta",
             syncVersion: this.nextSyncVersion(),
             traceStatus: debugResult.debug.traceStatus,
@@ -318,6 +391,27 @@ export class RealtimeCoordinator {
           });
         }
       }
+    }
+
+    const threadDeltaResults = await threadDeltaResultsPromise;
+    for (const result of threadDeltaResults) {
+      if (!result.ok) {
+        this.emitMessageToSockets(result.group.sockets, {
+          kind: "syncError",
+          syncVersion: this.nextSyncVersion(),
+          message: result.message,
+          code: "threadDeltaFailed",
+        });
+        continue;
+      }
+      if (!result.state) {
+        continue;
+      }
+      this.emitMessageToSockets(result.group.sockets, {
+        kind: "threadDelta",
+        syncVersion: this.nextSyncVersion(),
+        thread: result.state,
+      });
     }
   }
 
@@ -338,12 +432,30 @@ export class RealtimeCoordinator {
 
   private emitMessage(socket: Socket, message: UnifiedRealtimeServerMessage): void {
     const parsed = UnifiedRealtimeServerMessageSchema.parse(message);
-    socket.emit(REALTIME_SERVER_EVENT, parsed);
+    this.emitParsedMessage(socket, parsed);
+  }
+
+  private emitMessageToSockets(
+    sockets: Iterable<Socket>,
+    message: UnifiedRealtimeServerMessage,
+  ): void {
+    const parsed = UnifiedRealtimeServerMessageSchema.parse(message);
+    let encodedFrame: Uint8Array | null = null;
+    for (const socket of sockets) {
+      encodedFrame ??= encodeUnifiedRealtimeServerMessageFrame(parsed);
+      socket.emit(REALTIME_SERVER_FRAME_EVENT, encodedFrame);
+    }
   }
 
   private broadcastMessage(message: UnifiedRealtimeServerMessage): void {
-    const parsed = UnifiedRealtimeServerMessageSchema.parse(message);
-    this.io.emit(REALTIME_SERVER_EVENT, parsed);
+    this.emitMessageToSockets(this.io.sockets.sockets.values(), message);
+  }
+
+  private emitParsedMessage(socket: Socket, message: UnifiedRealtimeServerMessage): void {
+    socket.emit(
+      REALTIME_SERVER_FRAME_EVENT,
+      encodeUnifiedRealtimeServerMessageFrame(message),
+    );
   }
 
   private nextSyncVersion(): number {

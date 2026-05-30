@@ -454,7 +454,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.ensureCodexAvailable();
 
     const startedAt = performance.now();
-    const result = await this.runAppServerCall(() =>
+    const result = await this.runAppServerReadCall(() =>
       input.all
         ? this.appClient.listThreadsAll(
             input.cursor
@@ -801,19 +801,23 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   public async listModels(limit: number) {
     this.ensureCodexAvailable();
-    return this.runAppServerCall(() => this.appClient.listModels(limit));
+    return this.runAppServerReadCall(() => this.appClient.listModels(limit));
   }
 
   public async listCollaborationModes() {
     this.ensureCodexAvailable();
-    return this.runAppServerCall(() => this.appClient.listCollaborationModes());
+    return this.runAppServerReadCall(() =>
+      this.appClient.listCollaborationModes(),
+    );
   }
 
   public async readRateLimits(): Promise<
     import("@farfield/protocol").AppServerGetAccountRateLimitsResponse
   > {
     this.ensureCodexAvailable();
-    return this.runAppServerCall(() => this.appClient.readAccountRateLimits());
+    return this.runAppServerReadCall(() =>
+      this.appClient.readAccountRateLimits(),
+    );
   }
 
   public async setCollaborationMode(
@@ -917,20 +921,46 @@ export class CodexAgentAdapter implements AgentAdapter {
       requestId,
     );
     if (recordedOwner) {
+      if (
+        !recordedOwner.ownerClientId &&
+        !this.hasPendingAppServerRequest(threadId, requestId)
+      ) {
+        const route = this.resolveThreadActionRoute(
+          threadId,
+          ownerClientIdOverride,
+        );
+        return {
+          request,
+          ownerClientId:
+            route.kind === "desktop-owner" ? route.ownerClientId : null,
+        };
+      }
+
       return {
         request,
         ownerClientId: recordedOwner.ownerClientId,
       };
     }
 
-    const ownerClientId =
-      normalizeNonEmptyString(ownerClientIdOverride) ??
-      normalizeNonEmptyString(this.threadOwnerById.get(threadId));
+    const route = this.resolveThreadActionRoute(threadId, ownerClientIdOverride);
 
     return {
       request,
-      ownerClientId,
+      ownerClientId:
+        route.kind === "desktop-owner" ? route.ownerClientId : null,
     };
+  }
+
+  private hasPendingAppServerRequest(
+    threadId: string,
+    requestId: UserInputRequestId,
+  ): boolean {
+    const cachedEntries = this.pendingAppServerRequestsByThreadId.get(threadId);
+    return (
+      cachedEntries?.some((entry) =>
+        requestIdsMatch(entry.request.id, requestId),
+      ) ?? false
+    );
   }
 
   private async submitResolvedPendingThreadRequest(
@@ -1195,7 +1225,11 @@ export class CodexAgentAdapter implements AgentAdapter {
     params: IpcRequestFrame["params"],
     options: SendRequestOptions = {},
   ): Promise<IpcResponseFrame["result"]> {
-    this.ensureIpcReady();
+    if (options.targetClientId) {
+      this.ensureIpcConnected();
+    } else {
+      this.ensureIpcReady();
+    }
     const previewFrame: IpcFrame = {
       type: "request",
       requestId: "monitor-preview-request-id",
@@ -2424,6 +2458,9 @@ export class CodexAgentAdapter implements AgentAdapter {
     );
     if (ownerClientId) {
       this.recordDesktopThreadOwner(threadId, ownerClientId);
+      if (!this.runtimeState.ipcConnected) {
+        this.throwDisconnectedDesktopOwner(threadId);
+      }
       return {
         kind: "desktop-owner",
         ownerClientId,
@@ -2590,6 +2627,14 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
   }
 
+  private ensureIpcConnected(): void {
+    if (!this.runtimeState.ipcConnected) {
+      throw new Error(
+        this.runtimeState.lastError ?? "Desktop IPC is not connected",
+      );
+    }
+  }
+
   private scheduleIpcReconnect(): void {
     if (
       this.reconnectTimer ||
@@ -2605,6 +2650,17 @@ export class CodexAgentAdapter implements AgentAdapter {
     }, this.reconnectDelayMs);
   }
 
+  private isAppServerFatalReadError(message: string): boolean {
+    return (
+      message.includes("app-server request timed out: initialize") ||
+      message.startsWith("app-server exited") ||
+      message.includes("app-server failed to start") ||
+      message.includes("app-server process error") ||
+      message.includes("app-server transport closed") ||
+      message.includes("invalid app-server stdout")
+    );
+  }
+
   private async runAppServerCall<T>(operation: () => Promise<T>): Promise<T> {
     try {
       const result = await operation();
@@ -2617,6 +2673,28 @@ export class CodexAgentAdapter implements AgentAdapter {
       this.patchRuntimeState({
         appReady: !(error instanceof AppServerTransportError),
         lastError: toErrorMessage(error),
+      });
+      throw error;
+    }
+  }
+
+  private async runAppServerReadCall<T>(
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      const result = await operation();
+      this.patchRuntimeState({
+        appReady: true,
+        lastError: null,
+      });
+      return result;
+    } catch (error) {
+      const message = toErrorMessage(error);
+      this.patchRuntimeState({
+        appReady: this.isAppServerFatalReadError(message)
+          ? false
+          : this.runtimeState.appReady,
+        lastError: message,
       });
       throw error;
     }
@@ -2647,6 +2725,11 @@ export class CodexAgentAdapter implements AgentAdapter {
             lastError: message,
           });
           logger.warn({ error: message }, "codex-not-found");
+        } else if (!this.isAppServerFatalReadError(message)) {
+          this.patchRuntimeState({
+            appReady: true,
+            lastError: message,
+          });
         }
       }
 
